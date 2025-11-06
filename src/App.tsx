@@ -2,14 +2,29 @@ import { useEffect, useMemo, useRef, useState } from 'react'
 import { supabase } from './supabase'
 import './styles.css'
 
-type Player = { player_id: number; player_name: string; team: string }
+type Player = {
+  player_id: number
+  player_name: string
+  team: string
+  salary_2026: number | null
+  headshot_url: string | null
+}
 type Agg = { p_small:number; p_large:number; wins_small:number; wins_large:number }
+
+const avatarFor = (name: string, url?: string | null) =>
+  (url && url.length > 4)
+    ? url
+    : `https://ui-avatars.com/api/?name=${encodeURIComponent(name)}&background=random&bold=true`
+
+const fmtMoney = (n?: number | null) =>
+  (n == null ? '' : new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD', maximumFractionDigits: 0 }).format(n))
 
 function shuffle<T>(a: T[]): T[] {
   for (let i=a.length-1;i>0;i--){ const j=Math.floor(Math.random()*(i+1)); [a[i],a[j]]=[a[j],a[i]] }
   return a
 }
 
+// Bradley–Terry via MM updates using pair aggregates
 function bradleyTerry(players: Player[], aggs: Agg[], team?: string) {
   const filtered = players.filter(p => !team || p.team === team)
   const ids = filtered.map(p => p.player_id)
@@ -56,9 +71,16 @@ export default function App(){
 
   useEffect(()=>{ (async ()=>{
     setLoading(true)
-    const { data: p } = await supabase.from('players').select('player_id, player_name, team').eq('active', true)
-    setPlayers(p || [])
-    const { data: a } = await supabase.from('pairwise_aggregates').select('p_small, p_large, wins_small, wins_large')
+    // IMPORTANT: select salary_2026 and headshot_url
+    const { data: p } = await supabase
+      .from('players')
+      .select('player_id, player_name, team, salary_2026, headshot_url')
+      .eq('active', true)
+    setPlayers((p || []) as Player[])
+
+    const { data: a } = await supabase
+      .from('pairwise_aggregates')
+      .select('p_small, p_large, wins_small, wins_large')
     setAggs(a || [])
     setLoading(false)
   })() }, [])
@@ -83,6 +105,7 @@ export default function App(){
       winner_player_id: winner.player_id,
       team_context: team==='ALL' ? null : team
     })
+    // optimistic aggregate bump
     const a = Math.min(L.player_id, R.player_id)
     const b = Math.max(L.player_id, R.player_id)
     setAggs(prev => {
@@ -114,13 +137,34 @@ export default function App(){
       {pair ? (
         <div className="pair">
           <button className="card" onClick={()=>vote(pair[0])}>
-            <div className="name">{pair[0].player_name}</div>
-            <div className="team">{pair[0].team}</div>
+            <div style={{display:'flex', gap:12, alignItems:'center'}}>
+              <img
+                src={avatarFor(pair[0].player_name, pair[0].headshot_url)}
+                alt={pair[0].player_name}
+                style={{width:56, height:56, borderRadius:12, objectFit:'cover', border:'1px solid #e5e5e5'}}
+                loading="lazy"
+              />
+              <div>
+                <div className="name">{pair[0].player_name}</div>
+                <div className="team">{pair[0].team} • {fmtMoney(pair[0].salary_2026)}</div>
+              </div>
+            </div>
             <div className="vote">Vote</div>
           </button>
+
           <button className="card" onClick={()=>vote(pair[1])}>
-            <div className="name">{pair[1].player_name}</div>
-            <div className="team">{pair[1].team}</div>
+            <div style={{display:'flex', gap:12, alignItems:'center'}}>
+              <img
+                src={avatarFor(pair[1].player_name, pair[1].headshot_url)}
+                alt={pair[1].player_name}
+                style={{width:56, height:56, borderRadius:12, objectFit:'cover', border:'1px solid #e5e5e5'}}
+                loading="lazy"
+              />
+              <div>
+                <div className="name">{pair[1].player_name}</div>
+                <div className="team">{pair[1].team} • {fmtMoney(pair[1].salary_2026)}</div>
+              </div>
+            </div>
             <div className="vote">Vote</div>
           </button>
         </div>
@@ -133,7 +177,7 @@ export default function App(){
         {rankings.slice(0, 100).map((r,i)=>(
           <li key={r.player.player_id}>
             <span>{i+1}. {r.player.player_name} ({r.player.team})</span>
-            <span className="score">score {r.score.toFixed(4)}</span>
+            <span className="score">{fmtMoney(r.player.salary_2026)} • score {r.score.toFixed(4)}</span>
           </li>
         ))}
       </ol>
