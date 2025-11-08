@@ -1,8 +1,8 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { supabase } from "./supabase";
 import "./styles.css";
 
-/** ---------- Types ---------- */
+/* -------------------- Types -------------------- */
 type Player = {
   player_id: number;
   player_name: string;
@@ -20,7 +20,7 @@ type Agg = {
   wins_large: number;
 };
 
-/** ---------- Utils ---------- */
+/* -------------------- Utils -------------------- */
 const fmtMoney = (v?: number | null) => {
   if (v == null) return "";
   try {
@@ -34,19 +34,19 @@ const fmtMoney = (v?: number | null) => {
   }
 };
 
-const initials = (name: string) => {
-  const parts = name.trim().split(/\s+/);
-  const first = parts[0]?.[0] ?? "";
-  const last = parts.length > 1 ? parts[parts.length - 1][0] ?? "" : "";
-  return (first + last).toUpperCase();
-};
+const initials = (name: string) =>
+  name
+    .trim()
+    .split(/\s+/)
+    .map((s) => s[0])
+    .slice(0, 2)
+    .join("")
+    .toUpperCase();
 
 const avatarBg = (name: string) => {
-  // deterministic soft color from name
   let h = 0;
   for (let i = 0; i < name.length; i++) h = (h * 31 + name.charCodeAt(i)) >>> 0;
-  const hue = h % 360;
-  return `hsl(${hue} 65% 45%)`;
+  return `hsl(${h % 360} 65% 45%)`;
 };
 
 function PlayerAvatar({
@@ -98,22 +98,17 @@ function PlayerAvatar({
   );
 }
 
-/** ---------- Bradley–Terry MM -> Avg win rate vs random opponent ---------- */
-function bradleyTerryWithWinRate(
-  players: Player[],
-  aggs: Agg[],
-  team?: string
-) {
+/* -------------------- Bradley–Terry -> Avg win prob vs random opponent -------------------- */
+// score(i) = average_j Pr(i beats j) = average_j w_i / (w_i + w_j)
+function bradleyTerryWithWinRate(players: Player[], aggs: Agg[], team?: string) {
   const pool = players.filter((p) => !team || p.team === team);
   const ids = pool.map((p) => p.player_id);
   const idToIdx = new Map(ids.map((id, i) => [id, i]));
   const n = ids.length;
   if (n < 2) return pool.map((p) => ({ player: p, score: 0.5 }));
 
-  // Gentle prior to stabilize small samples
-  const prior = 0.5;
+  const prior = 0.5; // small smoothing
 
-  // Edge list
   const edges: Array<[number, number, number, number]> = [];
   for (const a of aggs) {
     const i = idToIdx.get(a.p_small);
@@ -121,53 +116,42 @@ function bradleyTerryWithWinRate(
     if (i == null || j == null) continue;
     edges.push([i, j, a.wins_small + prior, a.wins_large + prior]);
   }
-  if (edges.length === 0) {
-    return pool.map((p) => ({ player: p, score: 0.5 }));
-  }
+  if (edges.length === 0) return pool.map((p) => ({ player: p, score: 0.5 }));
 
-  // Initialize strengths
   const w = new Array(n).fill(1 / n);
 
-  // MM iterations
   for (let it = 0; it < 250; it++) {
     const denom = new Array(n).fill(0);
     const numer = new Array(n).fill(0);
 
     for (const [i, j, wij, wji] of edges) {
       const s = w[i] + w[j];
+      if (s <= 0) continue;
       const tot = wij + wji;
-      if (s <= 0 || tot <= 0) continue;
-
       denom[i] += tot * (w[i] / s);
       denom[j] += tot * (w[j] / s);
-
       numer[i] += wij;
       numer[j] += wji;
     }
 
-    for (let i = 0; i < n; i++) {
-      if (denom[i] > 0) w[i] = numer[i] / denom[i];
-    }
+    for (let i = 0; i < n; i++) if (denom[i] > 0) w[i] = numer[i] / denom[i];
 
-    // Normalize (sum=1)
-    const sum = w.reduce((a, b) => a + b, 0);
-    const s = sum || 1;
-    for (let i = 0; i < n; i++) w[i] /= s;
+    const sum = w.reduce((a, b) => a + b, 0) || 1;
+    for (let i = 0; i < n; i++) w[i] /= sum;
   }
 
-  // Average win probability vs a random opponent in current pool
-  const avgWinProb = (i: number) => {
+  const avgWin = (i: number) => {
     let s = 0;
     for (let j = 0; j < n; j++) if (j !== i) s += w[i] / (w[i] + w[j]);
     return s / (n - 1);
   };
 
-  const scored = pool.map((p, idx) => ({ player: p, score: avgWinProb(idx) }));
+  const scored = pool.map((p, idx) => ({ player: p, score: avgWin(idx) }));
   scored.sort((a, b) => b.score - a.score);
   return scored;
 }
 
-/** ---------- Data hooks ---------- */
+/* -------------------- Data fetch -------------------- */
 async function fetchPlayers(): Promise<Player[]> {
   const { data, error } = await supabase
     .from("players")
@@ -177,7 +161,6 @@ async function fetchPlayers(): Promise<Player[]> {
     .order("player_name", { ascending: true });
   if (error) throw error;
   const rows = (data || []) as Player[];
-  // If there's an 'active' column, keep only active; else keep all
   return rows.filter((r) => r.active == null || r.active);
 }
 
@@ -189,35 +172,63 @@ async function fetchAggs(): Promise<Agg[]> {
   return (data || []) as Agg[];
 }
 
-/** ---------- UI ---------- */
+/* -------------------- Balanced sampler -------------------- */
+/** Build exposure counts per player_id from aggregates. */
+function exposureCounts(aggs: Agg[]) {
+  const c = new Map<number, number>();
+  for (const a of aggs) {
+    c.set(a.p_small, (c.get(a.p_small) || 0) + a.wins_small + a.wins_large);
+    c.set(a.p_large, (c.get(a.p_large) || 0) + a.wins_small + a.wins_large);
+  }
+  return c;
+}
+
+/** Pick one underexposed + one random (no repeats), with a short cooldown. */
+function pickBalancedPair(pool: Player[], counts: Map<number, number>, cooldown: Set<string>) {
+  if (pool.length < 2) return [];
+
+  // sort by exposure ascending
+  const withCnt = pool
+    .map((p) => ({ p, cnt: counts.get(p.player_id) || 0 }))
+    .sort((a, b) => a.cnt - b.cnt);
+
+  // candidate A: among least-exposed 25%
+  const k = Math.max(1, Math.floor(withCnt.length * 0.25));
+  const a = withCnt[Math.floor(Math.random() * k)].p;
+
+  // candidate B: random different
+  let b: Player = a;
+  let guard = 0;
+  while (b.player_id === a.player_id && guard++ < 10) {
+    b = pool[Math.floor(Math.random() * pool.length)];
+  }
+
+  // avoid immediate repeats (unordered)
+  const key = (x: number, y: number) => (x < y ? `${x}-${y}` : `${y}-${x}`);
+  const pairKey = key(a.player_id, b.player_id);
+  if (cooldown.has(pairKey)) {
+    // try once more
+    guard = 0;
+    while (guard++ < 10) {
+      const cand = pool[Math.floor(Math.random() * pool.length)];
+      if (cand.player_id !== a.player_id && !cooldown.has(key(a.player_id, cand.player_id))) {
+        b = cand;
+        break;
+      }
+    }
+  }
+  return [a, b];
+}
+
+/* -------------------- App -------------------- */
 export default function App() {
   const [players, setPlayers] = useState<Player[]>([]);
   const [aggs, setAggs] = useState<Agg[]>([]);
   const [team, setTeam] = useState<string>("ALL");
-  const teams = useMemo(() => {
-    const t = Array.from(new Set(players.map((p) => p.team))).sort();
-    return ["ALL", ...t];
-  }, [players]);
-
-  // pick a pair to vote on
-  const pool = useMemo(
-    () => players.filter((p) => team === "ALL" || p.team === team),
-    [players, team]
-  );
   const [pair, setPair] = useState<Player[]>([]);
+  const cooldown = useRef<Set<string>>(new Set()); // remember recent pairs
+  const teams = useMemo(() => ["ALL", ...Array.from(new Set(players.map(p => p.team))).sort()], [players]);
 
-  const nextPair = () => {
-    if (pool.length < 2) {
-      setPair([]);
-      return;
-    }
-    const i = Math.floor(Math.random() * pool.length);
-    let j = Math.floor(Math.random() * pool.length);
-    if (j === i) j = (j + 1) % pool.length;
-    setPair([pool[i], pool[j]]);
-  };
-
-  // load data
   useEffect(() => {
     (async () => {
       const [pl, ag] = await Promise.all([fetchPlayers(), fetchAggs()]);
@@ -226,41 +237,67 @@ export default function App() {
     })().catch(console.error);
   }, []);
 
+  const pool = useMemo(
+    () => players.filter((p) => team === "ALL" || p.team === team),
+    [players, team]
+  );
+
+  const nextPair = () => {
+    if (pool.length < 2) {
+      setPair([]);
+      return;
+    }
+    const counts = exposureCounts(aggs);
+    const pick = pickBalancedPair(pool, counts, cooldown.current);
+    if (pick.length === 2) {
+      const [a, b] = pick;
+      setPair([a, b]);
+
+      // track cooldown (limit size)
+      const key = a.player_id < b.player_id ? `${a.player_id}-${b.player_id}` : `${b.player_id}-${a.player_id}`;
+      cooldown.current.add(key);
+      if (cooldown.current.size > 50) {
+        // drop oldest entry
+        const first = cooldown.current.values().next().value as string | undefined;
+        if (first) cooldown.current.delete(first);
+      }
+    }
+  };
+
   useEffect(() => {
     nextPair();
-  }, [pool.length]);
+    // reset cooldown when pool changes drastically
+    cooldown.current.clear();
+  }, [pool.length, team]);
 
-  // compute rankings with All-Our-Ideas style score
   const rankings = useMemo(
-    () =>
-      bradleyTerryWithWinRate(
-        players,
-        aggs,
-        team === "ALL" ? undefined : team
-      ),
+    () => bradleyTerryWithWinRate(players, aggs, team === "ALL" ? undefined : team),
     [players, aggs, team]
   );
 
-  const handleVote = async (winner: Player, loser: Player) => {
+  // IMPORTANT: store the on-screen left/right, winner separately.
+  const submitVote = async (winnerSide: "left" | "right") => {
+    if (pair.length !== 2) return;
+    const left = pair[0];
+    const right = pair[1];
+    const winnerId = winnerSide === "left" ? left.player_id : right.player_id;
+
     try {
-      const left = winner.player_id;
-      const right = loser.player_id;
-      // Store canonical order (small, large) in your view; for votes we just log what user saw
       const { error } = await supabase.from("pair_votes").insert([
         {
-          left_player_id: winner.player_id, // we keep the on-screen left/right simple
-          right_player_id: loser.player_id,
-          winner_player_id: winner.player_id,
+          left_player_id: left.player_id,   // on-screen left
+          right_player_id: right.player_id, // on-screen right
+          winner_player_id: winnerId,       // who won
         },
       ]);
       if (error) throw error;
 
-      // Refresh aggregates after vote
+      // refresh aggregates & pick next
       const ag = await fetchAggs();
       setAggs(ag);
-      nextPair();
     } catch (e) {
       console.error(e);
+    } finally {
       nextPair();
     }
   };
@@ -296,8 +333,8 @@ export default function App() {
       <section className="pair">
         {pair.length === 2 ? (
           <>
-            <PlayerCard player={pair[0]} onVote={() => handleVote(pair[0], pair[1])} />
-            <PlayerCard player={pair[1]} onVote={() => handleVote(pair[1], pair[0])} />
+            <PlayerCard player={pair[0]} onVote={() => submitVote("left")} />
+            <PlayerCard player={pair[1]} onVote={() => submitVote("right")} />
           </>
         ) : (
           <div className="loading">Loading players…</div>
@@ -319,7 +356,9 @@ export default function App() {
                     ? fmtMoney(r.player.salary_2026)
                     : r.player.salary_text ?? ""}
                   {" • "}
-                  <span className="score">score {(r.score * 100).toFixed(1)}</span>
+                  <span className="score">
+                    score {(r.score * 100).toFixed(1)}
+                  </span>
                 </span>
               </div>
             </li>
@@ -330,7 +369,7 @@ export default function App() {
   );
 }
 
-/** ---------- Presentational card ---------- */
+/* -------------------- Card -------------------- */
 function PlayerCard({
   player,
   onVote,
