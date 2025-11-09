@@ -1,247 +1,346 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+// src/App.tsx
+import React, { useEffect, useMemo, useState } from "react";
 import { supabase } from "./supabase";
 
 type Player = {
   player_id: number;
   player_name: string;
   team: string | null;
-  headshot_url: string | null;
-  salary_text: string | null;
-  active: boolean | null;
+  active?: boolean | null;
+  headshot_url?: string | null;
+  salary_text?: string | null;
+  salary_2026?: number | null;
 };
 
 type AggRow = {
   p_small: number;
   p_large: number;
-  wins_small: number;
-  wins_large: number;
-  n_votes?: number;
+  wins_small: number | null;
+  wins_large: number | null;
+  n_votes: number | null;
 };
 
-const TEAMS = [
-  "All Teams","ATL","BOS","BKN","CHA","CHI","CLE","DAL","DEN","DET","GSW","HOU","IND",
-  "LAC","LAL","MEM","MIA","MIL","MIN","NOP","NYK","OKC","ORL","PHI","PHX","POR","SAC",
-  "SAS","TOR","UTA","WAS"
-];
+function formatMoney(s?: string | null, n?: number | null) {
+  if (s && s.trim()) return s;
+  if (n != null) {
+    return n.toLocaleString("en-US", { style: "currency", currency: "USD", maximumFractionDigits: 0 });
+  }
+  return "—";
+}
 
-const initials = (name: string) =>
-  name.trim().split(/\s+/).slice(0,2).map(p => p[0] ?? "").join("").toUpperCase();
+/* -------------------- Bradley–Terry scoring (All Our Ideas style) -------------------- */
+/** Estimate strengths p_i so P(i beats j) = p_i / (p_i + p_j) and report
+ *  score = avg probability to beat a random opponent (0..1).
+ */
+function computeBT(
+  players: Player[],
+  agg: AggRow[],
+  options: { iters?: number; priorMatches?: number } = {}
+) {
+  const iters = options.iters ?? 60;
+  const priorMatches = options.priorMatches ?? 2; // small Laplace smoothing
+
+  const ids = players.map((p) => p.player_id);
+  const N = ids.length;
+
+  const idx = new Map<number, number>();
+  ids.forEach((id, i) => idx.set(id, i));
+
+  // directed wins W[i][j], undirected matches M[i][j]
+  const W = Array.from({ length: N }, () => new Array<number>(N).fill(0));
+  const M = Array.from({ length: N }, () => new Array<number>(N).fill(0));
+
+  for (const r of agg) {
+    const i = idx.get(r.p_small);
+    const j = idx.get(r.p_large);
+    if (i == null || j == null) continue;
+    const ws = r.wins_small ?? 0;
+    const wl = r.wins_large ?? 0;
+    const n = (r.n_votes ?? 0);
+    // i beat j: ws, j beat i: wl
+    W[i][j] += ws;
+    W[j][i] += wl;
+    M[i][j] += n;
+    M[j][i] += n;
+  }
+
+  // mild prior so cold-start players don't spike wildly
+  if (priorMatches > 0 && N > 1) {
+    const add = priorMatches / (N - 1);
+    for (let i = 0; i < N; i++) {
+      for (let j = 0; j < N; j++) if (i !== j) {
+        M[i][j] += add;
+        W[i][j] += add * 0.5;
+      }
+    }
+  }
+
+  const p = new Array<number>(N).fill(1); // initial abilities
+
+  for (let t = 0; t < iters; t++) {
+    const pNew = new Array<number>(N).fill(0);
+    for (let i = 0; i < N; i++) {
+      let Wi = 0;
+      let denom = 0;
+      for (let j = 0; j < N; j++) if (i !== j) {
+        const n_ij = M[i][j];
+        if (n_ij <= 0) continue;
+        Wi += W[i][j];
+        denom += n_ij / (p[i] + p[j]);
+      }
+      pNew[i] = denom > 0 ? Math.max(Wi / denom, 1e-12) : p[i];
+    }
+    // normalize for stability
+    const mean = pNew.reduce((a, b) => a + b, 0) / (N || 1);
+    for (let i = 0; i < N; i++) p[i] = pNew[i] / (mean || 1);
+  }
+
+  // score = avg P(i beats random j)
+  const probVsRandom = new Map<number, number>();
+  for (let i = 0; i < N; i++) {
+    if (N === 1) { probVsRandom.set(ids[i], 0.5); continue; }
+    let sum = 0;
+    for (let j = 0; j < N; j++) if (i !== j) {
+      sum += p[i] / (p[i] + p[j]);
+    }
+    probVsRandom.set(ids[i], sum / (N - 1));
+  }
+
+  // exposure for sampling (total matches involving i)
+  const exposure = new Map<number, number>();
+  for (let i = 0; i < N; i++) {
+    let votes = 0;
+    for (let j = 0; j < N; j++) if (i !== j) votes += M[i][j];
+    exposure.set(ids[i], votes);
+  }
+
+  return { probVsRandom, exposure };
+}
+
+/* --------------------------------- Data Fetch --------------------------------- */
+
+async function fetchPlayers(): Promise<Player[]> {
+  const { data, error } = await supabase
+    .from("players")
+    .select("player_id, player_name, team, active, headshot_url, salary_text, salary_2026")
+    .eq("active", true)
+    .order("player_name");
+  if (error) throw error;
+  return data ?? [];
+}
+
+async function fetchAgg(): Promise<AggRow[]> {
+  const { data, error } = await supabase
+    .from("pairwise_aggregates")
+    .select("p_small, p_large, wins_small, wins_large, n_votes");
+  if (error) throw error;
+  return data ?? [];
+}
+
+async function insertVote(leftId: number, rightId: number, winnerId: number) {
+  const { error } = await supabase
+    .from("pair_votes")
+    .insert([{ left_player_id: leftId, right_player_id: rightId, winner_player_id: winnerId }]);
+  if (error) throw error;
+}
+
+/* ------------------------------- UI Components ------------------------------- */
+
+function PlayerCard({
+  p,
+  onVote,
+  disabled,
+}: {
+  p: Player;
+  onVote: () => void;
+  disabled?: boolean;
+}) {
+  return (
+    <div className="card">
+      <div className="card__media">
+        {p.headshot_url ? (
+          <img src={p.headshot_url} alt={p.player_name} loading="lazy" />
+        ) : (
+          <div className="avatar-fallback">{p.player_name.slice(0, 1)}</div>
+        )}
+      </div>
+      <div className="card__body">
+        <div className="card__name">{p.player_name}</div>
+        <div className="card__meta">
+          <span className="chip">{p.team ?? "—"}</span>
+          <span className="dot">•</span>
+          <span>{formatMoney(p.salary_text, p.salary_2026)}</span>
+        </div>
+      </div>
+      <button className="btn" onClick={onVote} disabled={disabled}>VOTE</button>
+    </div>
+  );
+}
+
+/* ----------------------------------- App ----------------------------------- */
 
 export default function App() {
   const [players, setPlayers] = useState<Player[]>([]);
   const [agg, setAgg] = useState<AggRow[]>([]);
-  const [teamFilter, setTeamFilter] = useState<string>("All Teams");
-  const [left, setLeft] = useState<Player | null>(null);
-  const [right, setRight] = useState<Player | null>(null);
-  const [loadingVote, setLoadingVote] = useState(false);
-  const recentPairs = useRef<string[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [teamFilter, setTeamFilter] = useState<string>("ALL");
+  const [pair, setPair] = useState<[Player | null, Player | null]>([null, null]);
+  const [busy, setBusy] = useState(false);
 
-  // ---------- load players ----------
-  async function loadPlayers() {
-    const fields =
-      "player_id, player_name, team, headshot_url, salary_text, active";
-    let { data, error } = await supabase
-      .from("players_app")
-      .select(fields)
-      .eq("active", true)
-      .order("player_name", { ascending: true });
-
-    if (error) console.error("players_app error:", error);
-    if (!data || data.length === 0) {
-      const any = await supabase
-        .from("players_app")
-        .select(fields)
-        .order("player_name", { ascending: true });
-      if (any.error) console.error("players_app fallback error:", any.error);
-      data = any.data ?? [];
-    }
-    setPlayers(data ?? []);
-  }
-
-  // ---------- load aggregates ----------
-  async function loadAgg() {
-    const { data, error } = await supabase
-      .from("pairwise_aggregates")
-      .select("p_small, p_large, wins_small, wins_large, n_votes");
-    if (error) {
-      console.error("pairwise_aggregates error:", error);
-      setAgg([]);
-      return;
-    }
-    setAgg((data ?? []) as AggRow[]);
-  }
-
+  // load data
   useEffect(() => {
-    loadPlayers();
-    loadAgg();
-    const t = setInterval(loadAgg, 10000); // poll
-    return () => clearInterval(t);
+    (async () => {
+      setLoading(true);
+      try {
+        const [ps, a] = await Promise.all([fetchPlayers(), fetchAgg()]);
+        setPlayers(ps);
+        setAgg(a);
+      } finally {
+        setLoading(false);
+      }
+    })();
   }, []);
 
-  // Optional realtime (enable on table `pair_votes` in Supabase):
-  useEffect(() => {
-    const ch = supabase
-      .channel("votes_realtime")
-      .on(
-        "postgres_changes",
-        { event: "INSERT", schema: "public", table: "pair_votes" },
-        () => loadAgg()
-      )
-      .subscribe();
-    return () => { supabase.removeChannel(ch); };
-  }, []);
-
-  // ---------- stats / score ----------
-  const stats = useMemo(() => {
-    const m = new Map<number, { wins: number; losses: number; votes: number }>();
-    for (const p of players) m.set(p.player_id, { wins: 0, losses: 0, votes: 0 });
-
-    for (const r of agg) {
-      const n = r.n_votes ?? r.wins_small + r.wins_large;
-      const a = m.get(r.p_small);
-      const b = m.get(r.p_large);
-      if (a) { a.wins += r.wins_small; a.losses += r.wins_large; a.votes += n; }
-      if (b) { b.wins += r.wins_large; b.losses += r.wins_small; b.votes += n; }
-    }
-
-    const score = (id: number) => {
-      const s = m.get(id);
-      if (!s || s.votes === 0) return 0.5;
-      const wr = s.wins / (s.wins + s.losses);
-      return isFinite(wr) ? wr : 0.5;
-    };
-
-    return { map: m, score };
-  }, [players, agg]);
+  // BT scoring
+  const bt = useMemo(() => computeBT(players, agg, { iters: 60, priorMatches: 2 }), [players, agg]);
 
   const ranked = useMemo(
-    () => [...players]
-      .map(p => ({ player: p, score: stats.score(p.player_id) }))
-      .sort((a, b) => b.score - a.score),
-    [players, stats]
+    () =>
+      [...players]
+        .map((p) => ({
+          player: p,
+          score: bt.probVsRandom.get(p.player_id) ?? 0.5,
+        }))
+        .sort((a, b) => b.score - a.score),
+    [players, bt]
   );
 
-  // ---------- pick a pair ----------
+  // available teams
+  const teams = useMemo(() => {
+    const set = new Set<string>();
+    players.forEach((p) => p.team && set.add(p.team));
+    return ["ALL", ...Array.from(set).sort()];
+  }, [players]);
+
+  const filteredPlayers = useMemo(
+    () => (teamFilter === "ALL" ? players : players.filter((p) => p.team === teamFilter)),
+    [players, teamFilter]
+  );
+
+  // pick a pair, biasing to lower exposure (under-voted players)
   function pickPair() {
-    if (players.length < 2) return;
-
-    const pool = teamFilter === "All Teams"
-      ? players
-      : players.filter(p => p.team === teamFilter);
-
-    if (pool.length < 2) return;
-
-    const exposure = pool
-      .map(p => ({ p, votes: stats.map.get(p.player_id)?.votes ?? 0 }))
-      .sort((a, b) => a.votes - b.votes);
-
-    const slice = Math.max(2, Math.ceil(pool.length * 0.25));
-    const under = exposure.slice(0, slice).map(x => x.p);
-
-    function rand<T>(arr: T[]) { return arr[Math.floor(Math.random() * arr.length)]; }
-
-    let a: Player, b: Player;
-    let tries = 50;
-    while (tries-- > 0) {
-      a = Math.random() < 0.7 ? rand(under) : rand(pool);
-      do { b = rand(pool); } while (b.player_id === a.player_id);
-
-      const key = a.player_id < b.player_id
-        ? `${a.player_id}-${b.player_id}`
-        : `${b.player_id}-${a.player_id}`;
-
-      if (!recentPairs.current.includes(key)) {
-        recentPairs.current.unshift(key);
-        if (recentPairs.current.length > 50) recentPairs.current.pop();
-        setLeft(a); setRight(b);
-        return;
-      }
+    if (filteredPlayers.length < 2) {
+      setPair([null, null]);
+      return;
     }
-
-    a = rand(pool); do { b = rand(pool); } while (b.player_id === a.player_id);
-    setLeft(a); setRight(b);
+    const ids = filteredPlayers.map((p) => p.player_id);
+    const exps = ids.map((id) => bt.exposure.get(id) ?? 0);
+    const maxExp = Math.max(1, ...exps);
+    // weights ~ 1 / (1 + exposure), normalized
+    const weights = exps.map((e) => 1 / (1 + e));
+    const sumW = weights.reduce((a, b) => a + b, 0);
+    const pickIndex = () => {
+      const r = Math.random() * sumW;
+      let acc = 0;
+      for (let i = 0; i < weights.length; i++) {
+        acc += weights[i];
+        if (r <= acc) return i;
+      }
+      return weights.length - 1;
+    };
+    let i = pickIndex();
+    let j = pickIndex();
+    for (let tries = 0; tries < 6 && j === i; tries++) j = pickIndex();
+    const left = filteredPlayers[i];
+    const right = filteredPlayers[j === i ? (j + 1) % filteredPlayers.length : j];
+    setPair([left, right]);
   }
 
-  useEffect(() => { if (players.length) pickPair(); }, [players, teamFilter]);
-
-  // ---------- vote ----------
-  async function vote(side: "left" | "right") {
-    if (!left || !right || loadingVote) return;
-    setLoadingVote(true);
-    const winnerId = side === "left" ? left.player_id : right.player_id;
-
-    const { error } = await supabase.from("pair_votes").insert([{
-      left_player_id: left.player_id,
-      right_player_id: right.player_id,
-      winner_player_id: winnerId,
-    }]);
-
-    if (error) console.error("vote insert error:", error);
-
-    // refresh ranks immediately + next pair
-    await loadAgg();
-    setLoadingVote(false);
+  useEffect(() => {
     pickPair();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [teamFilter, players, agg]); // repick when data or filter change
+
+  async function handleVote(winner: Player, loser: Player) {
+    if (busy) return;
+    setBusy(true);
+    try {
+      // persist vote
+      await insertVote(winner.player_id, loser.player_id, winner.player_id);
+      // refresh aggregates (lightweight)
+      const a = await fetchAgg();
+      setAgg(a);
+      // new pair
+      pickPair();
+    } catch (e) {
+      console.error(e);
+      alert("Vote failed. Please try again.");
+    } finally {
+      setBusy(false);
+    }
   }
 
   return (
-    <div className="page">
-      <h1 className="title">HoopsHype Trade-Value Voter</h1>
-      <p className="subtitle">
-        Pick who has more <strong>trade value</strong>. Rankings update live.
-      </p>
+    <div className="shell">
+      <header className="header">
+        <h1>HoopsHype <strong>Trade</strong>-Value Voter</h1>
+        <p className="sub">Pick who has more <strong>trade value</strong>. Rankings update live.</p>
+        <div className="toolbar">
+          <label>
+            Team view:&nbsp;
+            <select value={teamFilter} onChange={(e) => setTeamFilter(e.target.value)}>
+              {teams.map((t) => (
+                <option key={t} value={t}>{t === "ALL" ? "All Teams" : t}</option>
+              ))}
+            </select>
+          </label>
+          <button className="btn" onClick={pickPair}>New Pair</button>
+        </div>
+      </header>
 
-      <div className="controls">
-        <label className="label">Team view:</label>
-        <select
-          className="select"
-          value={teamFilter}
-          onChange={(e) => setTeamFilter(e.target.value)}
-        >
-          {TEAMS.map(t => <option key={t} value={t}>{t}</option>)}
-        </select>
-        <button className="btn" onClick={pickPair}>New Pair</button>
-      </div>
+      <main>
+        <section className="vote-grid">
+          {loading ? (
+            <>
+              <div className="card loading" />
+              <div className="card loading" />
+            </>
+          ) : pair[0] && pair[1] ? (
+            <>
+              <PlayerCard
+                p={pair[0]}
+                disabled={busy}
+                onVote={() => handleVote(pair[0]!, pair[1]!)}
+              />
+              <PlayerCard
+                p={pair[1]}
+                disabled={busy}
+                onVote={() => handleVote(pair[1]!, pair[0]!)}
+              />
+            </>
+          ) : (
+            <div className="empty">No players available for this filter.</div>
+          )}
+        </section>
 
-      <div className="pair-row">
-        {[left, right].map((p, idx) => (
-          <div key={idx} className="pair-card">
-            {p?.headshot_url ? (
-              <img className="headshot" src={p.headshot_url} alt={p.player_name} />
-            ) : (
-              <div className="avatar">{p ? initials(p.player_name) : ""}</div>
-            )}
-            <div className="pair-info">
-              <div className="pair-name">{p?.player_name ?? "Loading…"}</div>
-              <div className="pair-meta">
-                {(p?.team ?? "").toUpperCase()} {p?.salary_text ? ` • ${p.salary_text}` : ""}
-              </div>
-            </div>
-            <button
-              className="btn-primary"
-              onClick={() => vote(idx === 0 ? "left" : "right")}
-              disabled={!p || loadingVote}
-            >
-              VOTE
-            </button>
-          </div>
-        ))}
-      </div>
-
-      <h2 className="section-title">Overall Rankings</h2>
-      <ol className="rank-list">
-        {ranked.map((r, i) => (
-          <li key={r.player.player_id} className="rank-row">
-            <span className="rank-text">
-              {i + 1}. {r.player.player_name} ({r.player.team || ""})
-            </span>
-            <span className="rank-meta">
-              {r.player.salary_text ? `${r.player.salary_text} • ` : ""}
-              score {(r.score * 100).toFixed(4)}
-            </span>
-          </li>
-        ))}
-      </ol>
+        <section className="table-block">
+          <h2>Overall Rankings</h2>
+          <ol className="rank-table">
+            {ranked.map(({ player, score }) => (
+              <li key={player.player_id} className="rank-row">
+                <span className="rank-name">
+                  {player.player_name} <span className="team">({player.team ?? "—"})</span>
+                </span>
+                <span className="rank-meta">
+                  <span className="salary">{formatMoney(player.salary_text, player.salary_2026)}</span>
+                  <span className="dot">•</span>
+                  <span className="score">score {(score * 100).toFixed(3)}</span>
+                </span>
+              </li>
+            ))}
+          </ol>
+        </section>
+      </main>
     </div>
   );
 }
