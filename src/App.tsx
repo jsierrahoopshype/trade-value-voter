@@ -1,397 +1,234 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { supabase } from "./supabase";
-import "./styles.css";
 
-/* -------------------- Types -------------------- */
+// ---------- Types ----------
 type Player = {
   player_id: number;
   player_name: string;
-  team: string;
-  headshot_url?: string | null;
-  salary_2026?: number | null;
-  salary_text?: string | null;
-  active?: boolean | null;
+  team: string | null;
+  headshot_url: string | null;
+  salary_text: string | null; // pretty string like "$18,485,916"
+  active: boolean | null;
 };
 
-type Agg = {
-  p_small: number;
-  p_large: number;
+type AggRow = {
+  p_small: number;   // lower id of the pair
+  p_large: number;   // higher id of the pair
   wins_small: number;
   wins_large: number;
+  n_votes?: number;  // optional (view may already provide it)
 };
 
-/* -------------------- Utils -------------------- */
-const fmtMoney = (v?: number | null) => {
-  if (v == null) return "";
-  try {
-    return new Intl.NumberFormat("en-US", {
-      style: "currency",
-      currency: "USD",
-      maximumFractionDigits: 0,
-    }).format(v);
-  } catch {
-    return `$${Math.round(v).toLocaleString()}`;
-  }
-};
+// ---------- UI helpers ----------
+const TEAMS = [
+  "All Teams","ATL","BOS","BKN","CHA","CHI","CLE","DAL","DEN","DET","GSW","HOU","IND",
+  "LAC","LAL","MEM","MIA","MIL","MIN","NOP","NYK","OKC","ORL","PHI","PHX","POR","SAC",
+  "SAS","TOR","UTA","WAS"
+];
 
-const initials = (name: string) =>
-  name
-    .trim()
-    .split(/\s+/)
-    .map((s) => s[0])
-    .slice(0, 2)
-    .join("")
-    .toUpperCase();
-
-const avatarBg = (name: string) => {
-  let h = 0;
-  for (let i = 0; i < name.length; i++) h = (h * 31 + name.charCodeAt(i)) >>> 0;
-  return `hsl(${h % 360} 65% 45%)`;
-};
-
-function PlayerAvatar({
-  name,
-  url,
-  size = 56,
-}: {
-  name: string;
-  url?: string | null;
-  size?: number;
-}) {
-  const [broken, setBroken] = useState(false);
-  if (!url || broken) {
-    return (
-      <div
-        style={{
-          width: size,
-          height: size,
-          borderRadius: 12,
-          display: "grid",
-          placeItems: "center",
-          fontWeight: 700,
-          color: "white",
-          background: avatarBg(name),
-          border: "1px solid #e5e5e5",
-        }}
-      >
-        {initials(name)}
-      </div>
-    );
-  }
-  return (
-    <img
-      alt={name}
-      src={url}
-      loading="lazy"
-      width={size}
-      height={size}
-      style={{
-        width: size,
-        height: size,
-        objectFit: "cover",
-        borderRadius: 12,
-        border: "1px solid #e5e5e5",
-        background: "#f8f8f8",
-      }}
-      onError={() => setBroken(true)}
-    />
-  );
+function initials(name: string) {
+  const parts = name.trim().split(/\s+/);
+  return (parts[0]?.[0] || "") + (parts[1]?.[0] || "");
 }
 
-/* -------------------- Bradley–Terry -> Avg win prob vs random opponent -------------------- */
-// score(i) = average_j Pr(i beats j) = average_j w_i / (w_i + w_j)
-function bradleyTerryWithWinRate(players: Player[], aggs: Agg[], team?: string) {
-  const pool = players.filter((p) => !team || p.team === team);
-  const ids = pool.map((p) => p.player_id);
-  const idToIdx = new Map(ids.map((id, i) => [id, i]));
-  const n = ids.length;
-  if (n < 2) return pool.map((p) => ({ player: p, score: 0.5 }));
-
-  const prior = 0.5; // small smoothing
-
-  const edges: Array<[number, number, number, number]> = [];
-  for (const a of aggs) {
-    const i = idToIdx.get(a.p_small);
-    const j = idToIdx.get(a.p_large);
-    if (i == null || j == null) continue;
-    edges.push([i, j, a.wins_small + prior, a.wins_large + prior]);
-  }
-  if (edges.length === 0) return pool.map((p) => ({ player: p, score: 0.5 }));
-
-  const w = new Array(n).fill(1 / n);
-
-  for (let it = 0; it < 250; it++) {
-    const denom = new Array(n).fill(0);
-    const numer = new Array(n).fill(0);
-
-    for (const [i, j, wij, wji] of edges) {
-      const s = w[i] + w[j];
-      if (s <= 0) continue;
-      const tot = wij + wji;
-      denom[i] += tot * (w[i] / s);
-      denom[j] += tot * (w[j] / s);
-      numer[i] += wij;
-      numer[j] += wji;
-    }
-
-    for (let i = 0; i < n; i++) if (denom[i] > 0) w[i] = numer[i] / denom[i];
-
-    const sum = w.reduce((a, b) => a + b, 0) || 1;
-    for (let i = 0; i < n; i++) w[i] /= sum;
-  }
-
-  const avgWin = (i: number) => {
-    let s = 0;
-    for (let j = 0; j < n; j++) if (j !== i) s += w[i] / (w[i] + w[j]);
-    return s / (n - 1);
-  };
-
-  const scored = pool.map((p, idx) => ({ player: p, score: avgWin(idx) }));
-  scored.sort((a, b) => b.score - a.score);
-  return scored;
-}
-
-/* -------------------- Data fetch -------------------- */
-async function fetchPlayers(): Promise<Player[]> {
-  const { data, error } = await supabase
-    .from("players")
-    .select(
-      "player_id, player_name, team, headshot_url, salary_2026, salary_text, active"
-    )
-    .order("player_name", { ascending: true });
-  if (error) throw error;
-  const rows = (data || []) as Player[];
-  return rows.filter((r) => r.active == null || r.active);
-}
-
-async function fetchAggs(): Promise<Agg[]> {
-  const { data, error } = await supabase
-    .from("pairwise_aggregates")
-    .select("p_small, p_large, wins_small, wins_large");
-  if (error) throw error;
-  return (data || []) as Agg[];
-}
-
-/* -------------------- Balanced sampler -------------------- */
-/** Build exposure counts per player_id from aggregates. */
-function exposureCounts(aggs: Agg[]) {
-  const c = new Map<number, number>();
-  for (const a of aggs) {
-    c.set(a.p_small, (c.get(a.p_small) || 0) + a.wins_small + a.wins_large);
-    c.set(a.p_large, (c.get(a.p_large) || 0) + a.wins_small + a.wins_large);
-  }
-  return c;
-}
-
-/** Pick one underexposed + one random (no repeats), with a short cooldown. */
-function pickBalancedPair(pool: Player[], counts: Map<number, number>, cooldown: Set<string>) {
-  if (pool.length < 2) return [];
-
-  // sort by exposure ascending
-  const withCnt = pool
-    .map((p) => ({ p, cnt: counts.get(p.player_id) || 0 }))
-    .sort((a, b) => a.cnt - b.cnt);
-
-  // candidate A: among least-exposed 25%
-  const k = Math.max(1, Math.floor(withCnt.length * 0.25));
-  const a = withCnt[Math.floor(Math.random() * k)].p;
-
-  // candidate B: random different
-  let b: Player = a;
-  let guard = 0;
-  while (b.player_id === a.player_id && guard++ < 10) {
-    b = pool[Math.floor(Math.random() * pool.length)];
-  }
-
-  // avoid immediate repeats (unordered)
-  const key = (x: number, y: number) => (x < y ? `${x}-${y}` : `${y}-${x}`);
-  const pairKey = key(a.player_id, b.player_id);
-  if (cooldown.has(pairKey)) {
-    // try once more
-    guard = 0;
-    while (guard++ < 10) {
-      const cand = pool[Math.floor(Math.random() * pool.length)];
-      if (cand.player_id !== a.player_id && !cooldown.has(key(a.player_id, cand.player_id))) {
-        b = cand;
-        break;
-      }
-    }
-  }
-  return [a, b];
-}
-
-/* -------------------- App -------------------- */
+// ---------- Component ----------
 export default function App() {
   const [players, setPlayers] = useState<Player[]>([]);
-  const [aggs, setAggs] = useState<Agg[]>([]);
-  const [team, setTeam] = useState<string>("ALL");
-  const [pair, setPair] = useState<Player[]>([]);
-  const cooldown = useRef<Set<string>>(new Set()); // remember recent pairs
-  const teams = useMemo(() => ["ALL", ...Array.from(new Set(players.map(p => p.team))).sort()], [players]);
+  const [agg, setAgg] = useState<AggRow[]>([]);
+  const [teamFilter, setTeamFilter] = useState<string>("All Teams");
+  const [left, setLeft]   = useState<Player | null>(null);
+  const [right, setRight] = useState<Player | null>(null);
+  const recentPairs = useRef<string[]>([]); // cooldown against repeats
 
+  // ------- Load players (NOTE: no '2026' bad column here) -------
   useEffect(() => {
     (async () => {
-      const [pl, ag] = await Promise.all([fetchPlayers(), fetchAggs()]);
-      setPlayers(pl);
-      setAggs(ag);
-    })().catch(console.error);
+      const { data, error } = await supabase
+        .from("players")
+        .select("player_id, player_name, team, headshot_url, salary_text, active")
+        .eq("active", true)
+        .order("player_name", { ascending: true });
+
+      if (error) {
+        console.error("load players error", error);
+        setPlayers([]);
+        return;
+      }
+      setPlayers(data || []);
+    })();
   }, []);
 
-  const pool = useMemo(
-    () => players.filter((p) => team === "ALL" || p.team === team),
-    [players, team]
-  );
-
-  const nextPair = () => {
-    if (pool.length < 2) {
-      setPair([]);
-      return;
-    }
-    const counts = exposureCounts(aggs);
-    const pick = pickBalancedPair(pool, counts, cooldown.current);
-    if (pick.length === 2) {
-      const [a, b] = pick;
-      setPair([a, b]);
-
-      // track cooldown (limit size)
-      const key = a.player_id < b.player_id ? `${a.player_id}-${b.player_id}` : `${b.player_id}-${a.player_id}`;
-      cooldown.current.add(key);
-      if (cooldown.current.size > 50) {
-        // drop oldest entry
-        const first = cooldown.current.values().next().value as string | undefined;
-        if (first) cooldown.current.delete(first);
-      }
-    }
-  };
-
+  // ------- Load aggregates for ranking & exposure -------
   useEffect(() => {
-    nextPair();
-    // reset cooldown when pool changes drastically
-    cooldown.current.clear();
-  }, [pool.length, team]);
+    (async () => {
+      const { data, error } = await supabase
+        .from("pairwise_aggregates")
+        .select("p_small, p_large, wins_small, wins_large, n_votes");
 
-  const rankings = useMemo(
-    () => bradleyTerryWithWinRate(players, aggs, team === "ALL" ? undefined : team),
-    [players, aggs, team]
-  );
+      if (error) {
+        console.error("load aggregates error", error);
+        setAgg([]);
+        return;
+      }
+      setAgg((data || []) as AggRow[]);
+    })();
+  }, []);
 
-  // IMPORTANT: store the on-screen left/right, winner separately.
-  const submitVote = async (winnerSide: "left" | "right") => {
-    if (pair.length !== 2) return;
-    const left = pair[0];
-    const right = pair[1];
-    const winnerId = winnerSide === "left" ? left.player_id : right.player_id;
-
-    try {
-      const { error } = await supabase.from("pair_votes").insert([
-        {
-          left_player_id: left.player_id,   // on-screen left
-          right_player_id: right.player_id, // on-screen right
-          winner_player_id: winnerId,       // who won
-        },
-      ]);
-      if (error) throw error;
-
-      // refresh aggregates & pick next
-      const ag = await fetchAggs();
-      setAggs(ag);
-    } catch (e) {
-      console.error(e);
-    } finally {
-      nextPair();
+  // ------- Build per-player stats & scores (win rate) -------
+  const stats = useMemo(() => {
+    const s = new Map<number, { wins: number; losses: number; votes: number }>();
+    for (const p of players) {
+      s.set(p.player_id, { wins: 0, losses: 0, votes: 0 });
     }
+    for (const r of agg) {
+      const n = r.n_votes ?? r.wins_small + r.wins_large;
+      const a = s.get(r.p_small); // order-insensitive
+      const b = s.get(r.p_large);
+      if (a) { a.wins += r.wins_small; a.losses += r.wins_large; a.votes += n; }
+      if (b) { b.wins += r.wins_large; b.losses += r.wins_small; b.votes += n; }
+    }
+    // score = win probability vs random opponent ≈ own win rate
+    const score = (id: number) => {
+      const x = s.get(id);
+      if (!x || x.votes === 0) return 0.5;
+      const wr = x.wins / (x.wins + x.losses);
+      return isFinite(wr) ? wr : 0.5;
+    };
+    return { map: s, score };
+  }, [players, agg]);
+
+  const ranked = useMemo(() => {
+    // sort by score desc
+    return [...players]
+      .map(p => ({ player: p, score: stats.score(p.player_id) }))
+      .sort((a, b) => b.score - a.score);
+  }, [players, stats]);
+
+  // ------- Balanced sampler (under-exposed + cooldown) -------
+  const pickPair = () => {
+    if (players.length < 2) return;
+
+    const pool = teamFilter === "All Teams"
+      ? players
+      : players.filter(p => p.team === teamFilter);
+
+    if (pool.length < 2) return;
+
+    // exposure proxy = votes
+    const exposureList = pool
+      .map(p => ({ p, votes: stats.map.get(p.player_id)?.votes ?? 0 }))
+      .sort((a, b) => a.votes - b.votes);
+
+    const slice = Math.max(2, Math.ceil(pool.length * 0.25));
+    const under = exposureList.slice(0, slice).map(x => x.p);
+    const rest  = exposureList.slice(slice).map(x => x.p);
+
+    function rand<T>(arr: T[]) { return arr[Math.floor(Math.random() * arr.length)]; }
+
+    let a: Player, b: Player;
+    const tryMake = (tries = 50) => {
+      while (tries-- > 0) {
+        a = rand(Math.random() < 0.7 ? under : pool);
+        do { b = rand(pool); } while (b.player_id === a.player_id);
+
+        const key = a.player_id < b.player_id
+          ? `${a.player_id}-${b.player_id}`
+          : `${b.player_id}-${a.player_id}`;
+
+        if (!recentPairs.current.includes(key)) {
+          recentPairs.current.unshift(key);
+          if (recentPairs.current.length > 50) recentPairs.current.pop();
+          return { a, b };
+        }
+      }
+      // fallback
+      a = rand(pool); do { b = rand(pool); } while (b.player_id === a.player_id);
+      return { a, b };
+    };
+
+    const pair = tryMake();
+    setLeft(pair.a); setRight(pair.b);
   };
 
+  useEffect(() => { if (players.length) pickPair(); /* eslint-disable-next-line */}, [players, teamFilter]);
+
+  // ------- Vote handler -------
+  const vote = async (winner: "left" | "right") => {
+    if (!left || !right) return;
+    const winnerId = winner === "left" ? left.player_id : right.player_id;
+
+    // record vote with on-screen order
+    const { error } = await supabase.from("pair_votes").insert([{
+      left_player_id: left.player_id,
+      right_player_id: right.player_id,
+      winner_player_id: winnerId,
+    }]);
+
+    if (error) console.error("insert vote error", error);
+
+    pickPair();
+  };
+
+  // ------- Render -------
   return (
-    <div className="page">
-      <header className="hdr">
-        <h1>HoopsHype Trade-Value Voter</h1>
-        <p className="sub">
-          Pick who has more <b>trade value</b>. Rankings update live.
-        </p>
-        <div className="controls">
-          <label>
-            Team view:
-            <select
-              value={team}
-              onChange={(e) => {
-                setTeam(e.target.value);
-                setTimeout(nextPair, 0);
-              }}
-            >
-              {teams.map((t) => (
-                <option key={t} value={t}>
-                  {t === "ALL" ? "All Teams" : t}
-                </option>
-              ))}
-            </select>
-          </label>
-          <button onClick={nextPair}>New Pair</button>
-        </div>
-      </header>
+    <div className="max-w-5xl mx-auto p-4">
+      <h1 className="text-2xl font-semibold mb-2">HoopsHype Trade-Value Voter</h1>
+      <p className="mb-4">Pick who has more <strong>trade value</strong>. Rankings update live.</p>
 
-      <section className="pair">
-        {pair.length === 2 ? (
-          <>
-            <PlayerCard player={pair[0]} onVote={() => submitVote("left")} />
-            <PlayerCard player={pair[1]} onVote={() => submitVote("right")} />
-          </>
-        ) : (
-          <div className="loading">Loading players…</div>
-        )}
-      </section>
-
-      <section className="rankings">
-        <h2>Overall Rankings</h2>
-        <ol>
-          {rankings.map((r, idx) => (
-            <li key={r.player.player_id}>
-              <div className="row">
-                <span className="num">{idx + 1}.</span>
-                <span className="name">
-                  {r.player.player_name} <em>({r.player.team})</em>
-                </span>
-                <span className="meta">
-                  {r.player.salary_2026 != null
-                    ? fmtMoney(r.player.salary_2026)
-                    : r.player.salary_text ?? ""}
-                  {" • "}
-                  <span className="score">
-                    score {(r.score * 100).toFixed(1)}
-                  </span>
-                </span>
-              </div>
-            </li>
-          ))}
-        </ol>
-      </section>
-    </div>
-  );
-}
-
-/* -------------------- Card -------------------- */
-function PlayerCard({
-  player,
-  onVote,
-}: {
-  player: Player;
-  onVote: () => void;
-}) {
-  const money =
-    player.salary_2026 != null
-      ? fmtMoney(player.salary_2026)
-      : player.salary_text ?? "";
-  return (
-    <button className="card" onClick={onVote}>
-      <div className="top">
-        <PlayerAvatar name={player.player_name} url={player.headshot_url ?? undefined} />
-        <div className="info">
-          <div className="nm">{player.player_name}</div>
-          <div className="tm">{player.team}</div>
-          <div className="sal">{money}</div>
-        </div>
+      <div className="flex items-center gap-2 mb-4">
+        <label>Team view:</label>
+        <select
+          value={teamFilter}
+          onChange={(e) => setTeamFilter(e.target.value)}
+        >
+          {TEAMS.map(t => <option key={t} value={t}>{t}</option>)}
+        </select>
+        <button onClick={pickPair}>New Pair</button>
       </div>
-      <div className="cta">VOTE</div>
-    </button>
+
+      <div className="grid grid-cols-1 md:grid-cols-2 gap-4 mb-6">
+        {[left, right].map((p, idx) => (
+          <div key={idx} className="border rounded-lg p-4 flex items-center gap-4">
+            {p?.headshot_url ? (
+              <img src={p.headshot_url} alt={p.player_name} width={64} height={64} style={{borderRadius: 8}} />
+            ) : (
+              <div style={{
+                width: 64, height: 64, borderRadius: 8,
+                display: "grid", placeItems: "center", background: "#eee", fontWeight: 700
+              }}>
+                {p ? initials(p.player_name) : ""}
+              </div>
+            )}
+            <div className="flex-1">
+              <div className="font-medium">{p?.player_name ?? "Loading…"}</div>
+              <div className="text-sm text-gray-600">
+                {(p?.team ?? "").toUpperCase()} {p?.salary_text ? ` • ${p.salary_text}` : ""}
+              </div>
+            </div>
+            <button
+              onClick={() => vote(idx === 0 ? "left" : "right")}
+              disabled={!p}
+            >
+              VOTE
+            </button>
+          </div>
+        ))}
+      </div>
+
+      <h2 className="text-xl font-semibold mb-2">Overall Rankings</h2>
+      <ol className="space-y-2">
+        {ranked.map((r, i) => (
+          <li key={r.player.player_id} className="flex items-center justify-between border-b pb-1">
+            <span>
+              {i + 1}. {r.player.player_name} ({r.player.team || ""})
+            </span>
+            <span className="text-sm text-gray-600">
+              {r.player.salary_text ? `${r.player.salary_text} • ` : ""}
+              score {(r.score * 100).toFixed(4)}
+            </span>
+          </li>
+        ))}
+      </ol>
+    </div>
   );
 }
