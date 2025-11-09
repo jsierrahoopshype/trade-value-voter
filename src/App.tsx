@@ -7,16 +7,16 @@ type Player = {
   player_name: string;
   team: string | null;
   headshot_url: string | null;
-  salary_text: string | null; // pretty string like "$18,485,916"
+  salary_text: string | null;
   active: boolean | null;
 };
 
 type AggRow = {
-  p_small: number;   // lower id of the pair
-  p_large: number;   // higher id of the pair
+  p_small: number;
+  p_large: number;
   wins_small: number;
   wins_large: number;
-  n_votes?: number;  // optional (view may already provide it)
+  n_votes?: number;
 };
 
 // ---------- UI helpers ----------
@@ -38,22 +38,46 @@ export default function App() {
   const [teamFilter, setTeamFilter] = useState<string>("All Teams");
   const [left, setLeft]   = useState<Player | null>(null);
   const [right, setRight] = useState<Player | null>(null);
-  const recentPairs = useRef<string[]>([]); // cooldown against repeats
+  const recentPairs = useRef<string[]>([]);
 
-  // ------- Load players (NOTE: no '2026' bad column here) -------
+  // ------- Load players (with robust fallbacks) -------
   useEffect(() => {
     (async () => {
-      const { data, error } = await supabase
+      const fields =
+        "player_id, player_name, team, headshot_url, salary_text, active";
+
+      // 1) Try active=true
+      let { data, error } = await supabase
         .from("players")
-        .select("player_id, player_name, team, headshot_url, salary_text, active")
+        .select(fields)
         .eq("active", true)
         .order("player_name", { ascending: true });
 
-      if (error) {
-        console.error("load players error", error);
-        setPlayers([]);
-        return;
+      if (error) console.error("players (active=true) error:", error);
+
+      // 2) If empty, try active is true OR null
+      if (!data || data.length === 0) {
+        const fallback = await supabase
+          .from("players")
+          .select(fields)
+          .or("active.is.true,active.is.null")
+          .order("player_name", { ascending: true });
+
+        if (fallback.error) console.error("players fallback error:", fallback.error);
+        data = fallback.data ?? data;
       }
+
+      // 3) Last resort: no filter (for debugging/data with no active flag)
+      if (!data || data.length === 0) {
+        const anyRows = await supabase
+          .from("players")
+          .select(fields)
+          .order("player_name", { ascending: true });
+
+        if (anyRows.error) console.error("players no-filter error:", anyRows.error);
+        data = anyRows.data ?? [];
+      }
+
       setPlayers(data || []);
     })();
   }, []);
@@ -74,31 +98,30 @@ export default function App() {
     })();
   }, []);
 
-  // ------- Build per-player stats & scores (win rate) -------
+  // ------- Build per-player stats & scores (win rate proxy) -------
   const stats = useMemo(() => {
     const s = new Map<number, { wins: number; losses: number; votes: number }>();
-    for (const p of players) {
-      s.set(p.player_id, { wins: 0, losses: 0, votes: 0 });
-    }
+    for (const p of players) s.set(p.player_id, { wins: 0, losses: 0, votes: 0 });
+
     for (const r of agg) {
       const n = r.n_votes ?? r.wins_small + r.wins_large;
-      const a = s.get(r.p_small); // order-insensitive
+      const a = s.get(r.p_small);
       const b = s.get(r.p_large);
       if (a) { a.wins += r.wins_small; a.losses += r.wins_large; a.votes += n; }
       if (b) { b.wins += r.wins_large; b.losses += r.wins_small; b.votes += n; }
     }
-    // score = win probability vs random opponent ≈ own win rate
+
     const score = (id: number) => {
       const x = s.get(id);
       if (!x || x.votes === 0) return 0.5;
       const wr = x.wins / (x.wins + x.losses);
       return isFinite(wr) ? wr : 0.5;
     };
+
     return { map: s, score };
   }, [players, agg]);
 
   const ranked = useMemo(() => {
-    // sort by score desc
     return [...players]
       .map(p => ({ player: p, score: stats.score(p.player_id) }))
       .sort((a, b) => b.score - a.score);
@@ -114,21 +137,19 @@ export default function App() {
 
     if (pool.length < 2) return;
 
-    // exposure proxy = votes
     const exposureList = pool
       .map(p => ({ p, votes: stats.map.get(p.player_id)?.votes ?? 0 }))
       .sort((a, b) => a.votes - b.votes);
 
     const slice = Math.max(2, Math.ceil(pool.length * 0.25));
     const under = exposureList.slice(0, slice).map(x => x.p);
-    const rest  = exposureList.slice(slice).map(x => x.p);
 
     function rand<T>(arr: T[]) { return arr[Math.floor(Math.random() * arr.length)]; }
 
     let a: Player, b: Player;
     const tryMake = (tries = 50) => {
       while (tries-- > 0) {
-        a = rand(Math.random() < 0.7 ? under : pool);
+        a = Math.random() < 0.7 ? rand(under) : rand(pool);
         do { b = rand(pool); } while (b.player_id === a.player_id);
 
         const key = a.player_id < b.player_id
@@ -141,7 +162,6 @@ export default function App() {
           return { a, b };
         }
       }
-      // fallback
       a = rand(pool); do { b = rand(pool); } while (b.player_id === a.player_id);
       return { a, b };
     };
@@ -157,7 +177,6 @@ export default function App() {
     if (!left || !right) return;
     const winnerId = winner === "left" ? left.player_id : right.player_id;
 
-    // record vote with on-screen order
     const { error } = await supabase.from("pair_votes").insert([{
       left_player_id: left.player_id,
       right_player_id: right.player_id,
@@ -165,7 +184,6 @@ export default function App() {
     }]);
 
     if (error) console.error("insert vote error", error);
-
     pickPair();
   };
 
@@ -177,10 +195,7 @@ export default function App() {
 
       <div className="flex items-center gap-2 mb-4">
         <label>Team view:</label>
-        <select
-          value={teamFilter}
-          onChange={(e) => setTeamFilter(e.target.value)}
-        >
+        <select value={teamFilter} onChange={(e) => setTeamFilter(e.target.value)}>
           {TEAMS.map(t => <option key={t} value={t}>{t}</option>)}
         </select>
         <button onClick={pickPair}>New Pair</button>
@@ -190,7 +205,7 @@ export default function App() {
         {[left, right].map((p, idx) => (
           <div key={idx} className="border rounded-lg p-4 flex items-center gap-4">
             {p?.headshot_url ? (
-              <img src={p.headshot_url} alt={p.player_name} width={64} height={64} style={{borderRadius: 8}} />
+              <img src={p.headshot_url} alt={p.player_name} width={64} height={64} style={{ borderRadius: 8 }} />
             ) : (
               <div style={{
                 width: 64, height: 64, borderRadius: 8,
@@ -205,12 +220,7 @@ export default function App() {
                 {(p?.team ?? "").toUpperCase()} {p?.salary_text ? ` • ${p.salary_text}` : ""}
               </div>
             </div>
-            <button
-              onClick={() => vote(idx === 0 ? "left" : "right")}
-              disabled={!p}
-            >
-              VOTE
-            </button>
+            <button onClick={() => vote(idx === 0 ? "left" : "right")} disabled={!p}>VOTE</button>
           </div>
         ))}
       </div>
