@@ -1,346 +1,308 @@
-// src/App.tsx
-import React, { useEffect, useMemo, useState } from "react";
-import { supabase } from "./supabase";
+import { useEffect, useMemo, useState } from "react";
+import { createClient } from "@supabase/supabase-js";
 
+// ---------- Supabase client (env must exist in Vercel) ----------
+const supabaseUrl = import.meta.env.VITE_SUPABASE_URL as string;
+const supabaseAnon = import.meta.env.VITE_SUPABASE_ANON_KEY as string;
+const supabase = createClient(supabaseUrl, supabaseAnon);
+
+// ---------- Types ----------
 type Player = {
   player_id: number;
   player_name: string;
   team: string | null;
-  active?: boolean | null;
-  headshot_url?: string | null;
-  salary_text?: string | null;
-  salary_2026?: number | null;
+  headshot_url: string | null;
+  salary_text: string | null;
+  salary_2026: number | null;
 };
 
-type AggRow = {
+type PairAgg = {
   p_small: number;
   p_large: number;
-  wins_small: number | null;
-  wins_large: number | null;
-  n_votes: number | null;
+  wins_small: number;
+  wins_large: number;
+  n_votes: number;
 };
 
-function formatMoney(s?: string | null, n?: number | null) {
-  if (s && s.trim()) return s;
-  if (n != null) {
-    return n.toLocaleString("en-US", { style: "currency", currency: "USD", maximumFractionDigits: 0 });
-  }
-  return "—";
+// ---------- Helpers ----------
+function initials(name: string) {
+  const parts = name.trim().split(/\s+/);
+  return parts.slice(0, 2).map(p => p[0]?.toUpperCase() ?? "").join("");
 }
 
-/* -------------------- Bradley–Terry scoring (All Our Ideas style) -------------------- */
-/** Estimate strengths p_i so P(i beats j) = p_i / (p_i + p_j) and report
- *  score = avg probability to beat a random opponent (0..1).
- */
-function computeBT(
-  players: Player[],
-  agg: AggRow[],
-  options: { iters?: number; priorMatches?: number } = {}
-) {
-  const iters = options.iters ?? 60;
-  const priorMatches = options.priorMatches ?? 2; // small Laplace smoothing
-
-  const ids = players.map((p) => p.player_id);
-  const N = ids.length;
-
-  const idx = new Map<number, number>();
-  ids.forEach((id, i) => idx.set(id, i));
-
-  // directed wins W[i][j], undirected matches M[i][j]
-  const W = Array.from({ length: N }, () => new Array<number>(N).fill(0));
-  const M = Array.from({ length: N }, () => new Array<number>(N).fill(0));
-
-  for (const r of agg) {
-    const i = idx.get(r.p_small);
-    const j = idx.get(r.p_large);
-    if (i == null || j == null) continue;
-    const ws = r.wins_small ?? 0;
-    const wl = r.wins_large ?? 0;
-    const n = (r.n_votes ?? 0);
-    // i beat j: ws, j beat i: wl
-    W[i][j] += ws;
-    W[j][i] += wl;
-    M[i][j] += n;
-    M[j][i] += n;
+function fmtMoney(x?: number | null) {
+  if (x == null) return "";
+  try {
+    return x.toLocaleString("en-US", { style: "currency", currency: "USD", maximumFractionDigits: 0 });
+  } catch {
+    return `$${Math.round(x).toLocaleString("en-US")}`;
   }
-
-  // mild prior so cold-start players don't spike wildly
-  if (priorMatches > 0 && N > 1) {
-    const add = priorMatches / (N - 1);
-    for (let i = 0; i < N; i++) {
-      for (let j = 0; j < N; j++) if (i !== j) {
-        M[i][j] += add;
-        W[i][j] += add * 0.5;
-      }
-    }
-  }
-
-  const p = new Array<number>(N).fill(1); // initial abilities
-
-  for (let t = 0; t < iters; t++) {
-    const pNew = new Array<number>(N).fill(0);
-    for (let i = 0; i < N; i++) {
-      let Wi = 0;
-      let denom = 0;
-      for (let j = 0; j < N; j++) if (i !== j) {
-        const n_ij = M[i][j];
-        if (n_ij <= 0) continue;
-        Wi += W[i][j];
-        denom += n_ij / (p[i] + p[j]);
-      }
-      pNew[i] = denom > 0 ? Math.max(Wi / denom, 1e-12) : p[i];
-    }
-    // normalize for stability
-    const mean = pNew.reduce((a, b) => a + b, 0) / (N || 1);
-    for (let i = 0; i < N; i++) p[i] = pNew[i] / (mean || 1);
-  }
-
-  // score = avg P(i beats random j)
-  const probVsRandom = new Map<number, number>();
-  for (let i = 0; i < N; i++) {
-    if (N === 1) { probVsRandom.set(ids[i], 0.5); continue; }
-    let sum = 0;
-    for (let j = 0; j < N; j++) if (i !== j) {
-      sum += p[i] / (p[i] + p[j]);
-    }
-    probVsRandom.set(ids[i], sum / (N - 1));
-  }
-
-  // exposure for sampling (total matches involving i)
-  const exposure = new Map<number, number>();
-  for (let i = 0; i < N; i++) {
-    let votes = 0;
-    for (let j = 0; j < N; j++) if (i !== j) votes += M[i][j];
-    exposure.set(ids[i], votes);
-  }
-
-  return { probVsRandom, exposure };
 }
 
-/* --------------------------------- Data Fetch --------------------------------- */
-
-async function fetchPlayers(): Promise<Player[]> {
-  const { data, error } = await supabase
-    .from("players")
-    .select("player_id, player_name, team, active, headshot_url, salary_text, salary_2026")
-    .eq("active", true)
-    .order("player_name");
-  if (error) throw error;
-  return data ?? [];
+function shuffle2<T>(arr: T[]): [T, T] {
+  if (arr.length < 2) throw new Error("Need at least 2 players");
+  const a = Math.floor(Math.random() * arr.length);
+  let b = Math.floor(Math.random() * arr.length);
+  while (b === a) b = Math.floor(Math.random() * arr.length);
+  return [arr[a], arr[b]];
 }
 
-async function fetchAgg(): Promise<AggRow[]> {
-  const { data, error } = await supabase
-    .from("pairwise_aggregates")
-    .select("p_small, p_large, wins_small, wins_large, n_votes");
-  if (error) throw error;
-  return data ?? [];
-}
-
-async function insertVote(leftId: number, rightId: number, winnerId: number) {
-  const { error } = await supabase
-    .from("pair_votes")
-    .insert([{ left_player_id: leftId, right_player_id: rightId, winner_player_id: winnerId }]);
-  if (error) throw error;
-}
-
-/* ------------------------------- UI Components ------------------------------- */
-
-function PlayerCard({
-  p,
-  onVote,
-  disabled,
-}: {
-  p: Player;
-  onVote: () => void;
-  disabled?: boolean;
-}) {
-  return (
-    <div className="card">
-      <div className="card__media">
-        {p.headshot_url ? (
-          <img src={p.headshot_url} alt={p.player_name} loading="lazy" />
-        ) : (
-          <div className="avatar-fallback">{p.player_name.slice(0, 1)}</div>
-        )}
-      </div>
-      <div className="card__body">
-        <div className="card__name">{p.player_name}</div>
-        <div className="card__meta">
-          <span className="chip">{p.team ?? "—"}</span>
-          <span className="dot">•</span>
-          <span>{formatMoney(p.salary_text, p.salary_2026)}</span>
-        </div>
-      </div>
-      <button className="btn" onClick={onVote} disabled={disabled}>VOTE</button>
-    </div>
-  );
-}
-
-/* ----------------------------------- App ----------------------------------- */
-
+// ---------- App ----------
 export default function App() {
   const [players, setPlayers] = useState<Player[]>([]);
-  const [agg, setAgg] = useState<AggRow[]>([]);
-  const [loading, setLoading] = useState(true);
-  const [teamFilter, setTeamFilter] = useState<string>("ALL");
-  const [pair, setPair] = useState<[Player | null, Player | null]>([null, null]);
-  const [busy, setBusy] = useState(false);
+  const [loadingPlayers, setLoadingPlayers] = useState(true);
 
-  // load data
+  const [pair, setPair] = useState<[Player | null, Player | null]>([null, null]);
+  const [teamFilter, setTeamFilter] = useState<string>("ALL");
+
+  const [ranking, setRanking] = useState<
+    { player: Player; score: number; wins: number; total: number }[]
+  >([]);
+  const [loadingRanks, setLoadingRanks] = useState(true);
+  const [voting, setVoting] = useState(false);
+
+  // ---- Load players (no active filter) ----
   useEffect(() => {
     (async () => {
-      setLoading(true);
-      try {
-        const [ps, a] = await Promise.all([fetchPlayers(), fetchAgg()]);
-        setPlayers(ps);
-        setAgg(a);
-      } finally {
-        setLoading(false);
+      setLoadingPlayers(true);
+      const { data, error } = await supabase
+        .from("players")
+        .select("player_id, player_name, team, headshot_url, salary_text, salary_2026")
+        .order("player_name");
+
+      if (error) {
+        console.error("load players error", error);
+        setPlayers([]);
+      } else {
+        setPlayers(data as Player[]);
       }
+      setLoadingPlayers(false);
     })();
   }, []);
 
-  // BT scoring
-  const bt = useMemo(() => computeBT(players, agg, { iters: 60, priorMatches: 2 }), [players, agg]);
+  // ---- Load pairwise aggregates and build “All Our Ideas”-style score ----
+  useEffect(() => {
+    (async () => {
+      setLoadingRanks(true);
 
-  const ranked = useMemo(
-    () =>
-      [...players]
-        .map((p) => ({
-          player: p,
-          score: bt.probVsRandom.get(p.player_id) ?? 0.5,
-        }))
-        .sort((a, b) => b.score - a.score),
-    [players, bt]
-  );
+      // Expect the view with columns: p_small, p_large, wins_small, wins_large, n_votes
+      const { data, error } = await supabase
+        .from("pairwise_aggregates")
+        .select("p_small, p_large, wins_small, wins_large, n_votes");
 
-  // available teams
-  const teams = useMemo(() => {
-    const set = new Set<string>();
-    players.forEach((p) => p.team && set.add(p.team));
-    return ["ALL", ...Array.from(set).sort()];
+      if (error) {
+        console.error("load pairwise_aggregates error", error);
+        setRanking([]);
+        setLoadingRanks(false);
+        return;
+      }
+
+      const rows = (data || []) as PairAgg[];
+
+      // Accumulate per-player wins/total
+      const wins = new Map<number, number>();
+      const tot = new Map<number, number>();
+
+      const add = (id: number, w: number, t: number) => {
+        wins.set(id, (wins.get(id) || 0) + w);
+        tot.set(id, (tot.get(id) || 0) + t);
+      };
+
+      for (const r of rows) {
+        // p_small’s wins vs p_large are wins_small
+        add(r.p_small, r.wins_small, r.n_votes);
+        // p_large’s wins vs p_small are wins_large
+        add(r.p_large, r.wins_large, r.n_votes);
+      }
+
+      // Create ranking array (default 0 when no votes)
+      const byId = new Map(players.map(p => [p.player_id, p]));
+      const ranked = players.map(p => {
+        const w = wins.get(p.player_id) || 0;
+        const t = tot.get(p.player_id) || 0;
+        const score = t > 0 ? (w / t) * 100 : 50; // prior: 50 when unseen
+        return { player: p, score, wins: w, total: t };
+      });
+
+      ranked.sort((a, b) => b.score - a.score);
+      setRanking(ranked);
+      setLoadingRanks(false);
+    })();
+    // re-run when players change (so we always score current list)
   }, [players]);
 
-  const filteredPlayers = useMemo(
-    () => (teamFilter === "ALL" ? players : players.filter((p) => p.team === teamFilter)),
-    [players, teamFilter]
-  );
+  // ---- Build list for current team filter ----
+  const filteredPlayers = useMemo(() => {
+    if (teamFilter === "ALL") return players;
+    return players.filter(p => (p.team || "").toUpperCase() === teamFilter);
+  }, [players, teamFilter]);
 
-  // pick a pair, biasing to lower exposure (under-voted players)
-  function pickPair() {
+  // ---- Pick a new pair for current filter ----
+  const dealPair = () => {
     if (filteredPlayers.length < 2) {
       setPair([null, null]);
       return;
     }
-    const ids = filteredPlayers.map((p) => p.player_id);
-    const exps = ids.map((id) => bt.exposure.get(id) ?? 0);
-    const maxExp = Math.max(1, ...exps);
-    // weights ~ 1 / (1 + exposure), normalized
-    const weights = exps.map((e) => 1 / (1 + e));
-    const sumW = weights.reduce((a, b) => a + b, 0);
-    const pickIndex = () => {
-      const r = Math.random() * sumW;
-      let acc = 0;
-      for (let i = 0; i < weights.length; i++) {
-        acc += weights[i];
-        if (r <= acc) return i;
-      }
-      return weights.length - 1;
-    };
-    let i = pickIndex();
-    let j = pickIndex();
-    for (let tries = 0; tries < 6 && j === i; tries++) j = pickIndex();
-    const left = filteredPlayers[i];
-    const right = filteredPlayers[j === i ? (j + 1) % filteredPlayers.length : j];
-    setPair([left, right]);
-  }
+    const [a, b] = shuffle2(filteredPlayers);
+    setPair([a, b]);
+  };
 
+  // pick a pair on load / whenever filter changes or players load
   useEffect(() => {
-    pickPair();
+    if (!loadingPlayers) dealPair();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [teamFilter, players, agg]); // repick when data or filter change
+  }, [loadingPlayers, teamFilter]);
 
-  async function handleVote(winner: Player, loser: Player) {
-    if (busy) return;
-    setBusy(true);
-    try {
-      // persist vote
-      await insertVote(winner.player_id, loser.player_id, winner.player_id);
-      // refresh aggregates (lightweight)
-      const a = await fetchAgg();
-      setAgg(a);
-      // new pair
-      pickPair();
-    } catch (e) {
-      console.error(e);
-      alert("Vote failed. Please try again.");
-    } finally {
-      setBusy(false);
+  // ---- Teams for dropdown ----
+  const teams = useMemo(() => {
+    const set = new Set<string>();
+    for (const p of players) {
+      const t = (p.team || "").toUpperCase();
+      if (t) set.add(t);
     }
-  }
+    return ["ALL", ...Array.from(set).sort()];
+  }, [players]);
 
-  return (
-    <div className="shell">
-      <header className="header">
-        <h1>HoopsHype <strong>Trade</strong>-Value Voter</h1>
-        <p className="sub">Pick who has more <strong>trade value</strong>. Rankings update live.</p>
-        <div className="toolbar">
-          <label>
-            Team view:&nbsp;
-            <select value={teamFilter} onChange={(e) => setTeamFilter(e.target.value)}>
-              {teams.map((t) => (
-                <option key={t} value={t}>{t === "ALL" ? "All Teams" : t}</option>
-              ))}
-            </select>
-          </label>
-          <button className="btn" onClick={pickPair}>New Pair</button>
-        </div>
-      </header>
+  // ---- Vote handler ----
+  const doVote = async (winner: Player, loser: Player) => {
+    try {
+      setVoting(true);
+      const left_id = pair[0]?.player_id ?? null;
+      const right_id = pair[1]?.player_id ?? null;
+      const { error } = await supabase.from("pair_votes").insert({
+        left_player_id: left_id,
+        right_player_id: right_id,
+        winner_player_id: winner.player_id,
+      });
+      if (error) {
+        console.error("insert vote error", error);
+      }
+    } finally {
+      setVoting(false);
+      dealPair(); // show a fresh pair
+      // Optimistic: nudge the winner’s score locally to feel responsive (optional)
+      setRanking(prev => {
+        const n = prev.map(r =>
+          r.player.player_id === (winner.player_id)
+            ? { ...r, total: r.total + 1, wins: r.wins + 1, score: ((r.wins + 1) / (r.total + 1)) * 100 }
+            : r.player.player_id === (loser.player_id)
+            ? { ...r, total: r.total + 1, score: (r.wins / (r.total + 1)) * 100 }
+            : r
+        );
+        n.sort((a, b) => b.score - a.score);
+        return n;
+      });
+    }
+  };
 
-      <main>
-        <section className="vote-grid">
-          {loading ? (
-            <>
-              <div className="card loading" />
-              <div className="card loading" />
-            </>
-          ) : pair[0] && pair[1] ? (
-            <>
-              <PlayerCard
-                p={pair[0]}
-                disabled={busy}
-                onVote={() => handleVote(pair[0]!, pair[1]!)}
-              />
-              <PlayerCard
-                p={pair[1]}
-                disabled={busy}
-                onVote={() => handleVote(pair[1]!, pair[0]!)}
-              />
-            </>
+  // ---- Render helpers ----
+  const PlayerCard = ({ p, onVote }: { p: Player; onVote: () => void }) => {
+    const head = p.headshot_url;
+    return (
+      <div style={{
+        border: "1px solid #ddd",
+        borderRadius: 12,
+        padding: 12,
+        width: 340,
+        display: "flex",
+        gap: 12,
+        alignItems: "center",
+        boxShadow: "0 1px 3px rgba(0,0,0,0.08)"
+      }}>
+        <div style={{
+          width: 64, height: 64, borderRadius: 8, overflow: "hidden",
+          display: "flex", alignItems: "center", justifyContent: "center",
+          background: "#f3f4f6", border: "1px solid #e5e7eb", flexShrink: 0
+        }}>
+          {head ? (
+            // Avoid layout shift while loading images
+            <img src={head} alt={p.player_name} width={64} height={64} style={{ objectFit: "cover" }} />
           ) : (
-            <div className="empty">No players available for this filter.</div>
+            <div style={{ fontWeight: 700, fontSize: 20 }}>{initials(p.player_name)}</div>
           )}
-        </section>
+        </div>
+        <div style={{ flex: 1 }}>
+          <div style={{ fontWeight: 700 }}>{p.player_name}</div>
+          <div style={{ fontSize: 12, color: "#4b5563" }}>
+            {(p.team || "").toUpperCase()}
+            {p.salary_text ? ` • ${p.salary_text}` : p.salary_2026 ? ` • ${fmtMoney(p.salary_2026)}` : ""}
+          </div>
+          <button
+            onClick={onVote}
+            disabled={voting}
+            style={{
+              marginTop: 8,
+              padding: "6px 10px",
+              borderRadius: 8,
+              border: "1px solid #e5e7eb",
+              background: voting ? "#f9fafb" : "#111827",
+              color: voting ? "#6b7280" : "white",
+              cursor: voting ? "not-allowed" : "pointer"
+            }}
+          >
+            VOTE
+          </button>
+        </div>
+      </div>
+    );
+  };
 
-        <section className="table-block">
-          <h2>Overall Rankings</h2>
-          <ol className="rank-table">
-            {ranked.map(({ player, score }) => (
-              <li key={player.player_id} className="rank-row">
-                <span className="rank-name">
-                  {player.player_name} <span className="team">({player.team ?? "—"})</span>
-                </span>
-                <span className="rank-meta">
-                  <span className="salary">{formatMoney(player.salary_text, player.salary_2026)}</span>
-                  <span className="dot">•</span>
-                  <span className="score">score {(score * 100).toFixed(3)}</span>
-                </span>
-              </li>
-            ))}
-          </ol>
-        </section>
-      </main>
+  // ---- UI ----
+  return (
+    <div style={{ maxWidth: 980, margin: "0 auto", padding: 16 }}>
+      <h1 style={{ fontSize: 28, fontWeight: 800, marginBottom: 8 }}>
+        HoopsHype Trade-Value Voter
+      </h1>
+      <div style={{ color: "#374151", marginBottom: 12 }}>
+        Pick who has more <b>trade value</b>. Rankings update live.
+      </div>
+
+      <div style={{ display: "flex", gap: 8, alignItems: "center", marginBottom: 14 }}>
+        <span>Team view:</span>
+        <select
+          value={teamFilter}
+          onChange={(e) => setTeamFilter(e.target.value)}
+          style={{ padding: "6px 8px", borderRadius: 8, border: "1px solid #e5e7eb" }}
+        >
+          {teams.map(t => <option key={t} value={t}>{t === "ALL" ? "All Teams" : t}</option>)}
+        </select>
+        <button
+          onClick={dealPair}
+          style={{ marginLeft: 6, padding: "6px 10px", borderRadius: 8, border: "1px solid #e5e7eb", background: "#f9fafb" }}
+        >
+          New Pair
+        </button>
+      </div>
+
+      {/* Pair */}
+      <div style={{ display: "flex", gap: 16, marginBottom: 20 }}>
+        {loadingPlayers ? (
+          <div>Loading players…</div>
+        ) : pair[0] && pair[1] ? (
+          <>
+            <PlayerCard p={pair[0]} onVote={() => doVote(pair[0]!, pair[1]!)} />
+            <PlayerCard p={pair[1]} onVote={() => doVote(pair[1]!, pair[0]!)} />
+          </>
+        ) : (
+          <div>No players available for this filter.</div>
+        )}
+      </div>
+
+      {/* Rankings */}
+      <h2 style={{ fontSize: 22, fontWeight: 800, marginTop: 20, marginBottom: 10 }}>Overall Rankings</h2>
+      {loadingRanks ? (
+        <div>Loading rankings…</div>
+      ) : (
+        <ol style={{ paddingLeft: 20, lineHeight: 1.7 }}>
+          {ranking.map((r, i) => (
+            <li key={r.player.player_id}>
+              {i + 1}. {r.player.player_name} ({(r.player.team || "").toUpperCase()})
+              {r.player.salary_text ? ` • ${r.player.salary_text}` : ""}
+              {` • score ${r.score.toFixed(4)}`}
+            </li>
+          ))}
+        </ol>
+      )}
     </div>
   );
 }
