@@ -1,308 +1,243 @@
-import { useEffect, useMemo, useState } from "react";
-import { createClient } from "@supabase/supabase-js";
+import React, { useEffect, useMemo, useState } from 'react'
+import { supabase } from './supabase'
+import './styles.css'
 
-// ---------- Supabase client (env must exist in Vercel) ----------
-const supabaseUrl = import.meta.env.VITE_SUPABASE_URL as string;
-const supabaseAnon = import.meta.env.VITE_SUPABASE_ANON_KEY as string;
-const supabase = createClient(supabaseUrl, supabaseAnon);
-
-// ---------- Types ----------
 type Player = {
-  player_id: number;
-  player_name: string;
-  team: string | null;
-  headshot_url: string | null;
-  salary_text: string | null;
-  salary_2026: number | null;
-};
-
-type PairAgg = {
-  p_small: number;
-  p_large: number;
-  wins_small: number;
-  wins_large: number;
-  n_votes: number;
-};
-
-// ---------- Helpers ----------
-function initials(name: string) {
-  const parts = name.trim().split(/\s+/);
-  return parts.slice(0, 2).map(p => p[0]?.toUpperCase() ?? "").join("");
+  player_id: number
+  player_name: string
+  team: string | null
+  active: boolean
+  headshot_url: string | null
+  salary_text: string | null
 }
 
-function fmtMoney(x?: number | null) {
-  if (x == null) return "";
-  try {
-    return x.toLocaleString("en-US", { style: "currency", currency: "USD", maximumFractionDigits: 0 });
-  } catch {
-    return `$${Math.round(x).toLocaleString("en-US")}`;
-  }
+type PairRow = {
+  p_small: number
+  p_large: number
+  wins_small: number
+  wins_large: number
+  n_votes: number
 }
 
-function shuffle2<T>(arr: T[]): [T, T] {
-  if (arr.length < 2) throw new Error("Need at least 2 players");
-  const a = Math.floor(Math.random() * arr.length);
-  let b = Math.floor(Math.random() * arr.length);
-  while (b === a) b = Math.floor(Math.random() * arr.length);
-  return [arr[a], arr[b]];
+type Score = {
+  player_id: number
+  wins: number
+  total: number
+  score: number // 0..100 – p(win vs random) * 100
 }
 
-// ---------- App ----------
+const TEAMS = [
+  'All Teams','ATL','BOS','BKN','CHA','CHI','CLE','DAL','DEN','DET','GSW','HOU','IND','LAC','LAL','MEM','MIA',
+  'MIL','MIN','NOP','NYK','OKC','ORL','PHI','PHX','POR','SAC','SAS','TOR','UTA','WAS'
+]
+
+function formatScore(s: number) {
+  return (Math.round(s * 10000) / 10000).toFixed(4)
+}
+
+function letterAvatar(name: string) {
+  const initials = name.split(' ').map(w => w[0]).slice(0,2).join('').toUpperCase()
+  return `https://placehold.co/160x160?text=${encodeURIComponent(initials)}`
+}
+
 export default function App() {
-  const [players, setPlayers] = useState<Player[]>([]);
-  const [loadingPlayers, setLoadingPlayers] = useState(true);
+  const [players, setPlayers] = useState<Player[]>([])
+  const [pairs, setPairs] = useState<PairRow[]>([])
+  const [teamFilter, setTeamFilter] = useState<string>('All Teams')
+  const [loading, setLoading] = useState(true)
+  const [left, setLeft] = useState<Player | null>(null)
+  const [right, setRight] = useState<Player | null>(null)
+  const [submitting, setSubmitting] = useState(false)
 
-  const [pair, setPair] = useState<[Player | null, Player | null]>([null, null]);
-  const [teamFilter, setTeamFilter] = useState<string>("ALL");
-
-  const [ranking, setRanking] = useState<
-    { player: Player; score: number; wins: number; total: number }[]
-  >([]);
-  const [loadingRanks, setLoadingRanks] = useState(true);
-  const [voting, setVoting] = useState(false);
-
-  // ---- Load players (no active filter) ----
+  // ---- load players and aggregates
   useEffect(() => {
-    (async () => {
-      setLoadingPlayers(true);
-      const { data, error } = await supabase
-        .from("players")
-        .select("player_id, player_name, team, headshot_url, salary_text, salary_2026")
-        .order("player_name");
+    let cancelled = false
+    ;(async () => {
+      setLoading(true)
 
-      if (error) {
-        console.error("load players error", error);
-        setPlayers([]);
-      } else {
-        setPlayers(data as Player[]);
-      }
-      setLoadingPlayers(false);
-    })();
-  }, []);
+      // players from the tv view (read-only)
+      const { data: pData, error: pErr } = await supabase
+        .from('tv_players')
+        .select('player_id,player_name,team,active,headshot_url,salary_text')
+        .order('player_name', { ascending: true })
 
-  // ---- Load pairwise aggregates and build “All Our Ideas”-style score ----
-  useEffect(() => {
-    (async () => {
-      setLoadingRanks(true);
-
-      // Expect the view with columns: p_small, p_large, wins_small, wins_large, n_votes
-      const { data, error } = await supabase
-        .from("pairwise_aggregates")
-        .select("p_small, p_large, wins_small, wins_large, n_votes");
-
-      if (error) {
-        console.error("load pairwise_aggregates error", error);
-        setRanking([]);
-        setLoadingRanks(false);
-        return;
+      if (pErr) {
+        console.error('players error', pErr)
+        setLoading(false)
+        return
       }
 
-      const rows = (data || []) as PairAgg[];
+      // aggregates view
+      const { data: aData, error: aErr } = await supabase
+        .from('tv_pairwise_aggregates')
+        .select('p_small,p_large,wins_small,wins_large,n_votes')
 
-      // Accumulate per-player wins/total
-      const wins = new Map<number, number>();
-      const tot = new Map<number, number>();
-
-      const add = (id: number, w: number, t: number) => {
-        wins.set(id, (wins.get(id) || 0) + w);
-        tot.set(id, (tot.get(id) || 0) + t);
-      };
-
-      for (const r of rows) {
-        // p_small’s wins vs p_large are wins_small
-        add(r.p_small, r.wins_small, r.n_votes);
-        // p_large’s wins vs p_small are wins_large
-        add(r.p_large, r.wins_large, r.n_votes);
+      if (aErr) {
+        console.error('aggregates error', aErr)
+        setLoading(false)
+        return
       }
 
-      // Create ranking array (default 0 when no votes)
-      const byId = new Map(players.map(p => [p.player_id, p]));
-      const ranked = players.map(p => {
-        const w = wins.get(p.player_id) || 0;
-        const t = tot.get(p.player_id) || 0;
-        const score = t > 0 ? (w / t) * 100 : 50; // prior: 50 when unseen
-        return { player: p, score, wins: w, total: t };
-      });
+      if (!cancelled) {
+        setPlayers(pData || [])
+        setPairs(aData || [])
+        setLoading(false)
+      }
+    })()
 
-      ranked.sort((a, b) => b.score - a.score);
-      setRanking(ranked);
-      setLoadingRanks(false);
-    })();
-    // re-run when players change (so we always score current list)
-  }, [players]);
+    return () => { cancelled = true }
+  }, [])
 
-  // ---- Build list for current team filter ----
-  const filteredPlayers = useMemo(() => {
-    if (teamFilter === "ALL") return players;
-    return players.filter(p => (p.team || "").toUpperCase() === teamFilter);
-  }, [players, teamFilter]);
-
-  // ---- Pick a new pair for current filter ----
-  const dealPair = () => {
-    if (filteredPlayers.length < 2) {
-      setPair([null, null]);
-      return;
-    }
-    const [a, b] = shuffle2(filteredPlayers);
-    setPair([a, b]);
-  };
-
-  // pick a pair on load / whenever filter changes or players load
-  useEffect(() => {
-    if (!loadingPlayers) dealPair();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [loadingPlayers, teamFilter]);
-
-  // ---- Teams for dropdown ----
-  const teams = useMemo(() => {
-    const set = new Set<string>();
+  // ---- compute simple “p vs random” from aggregates
+  const coverage = useMemo(() => {
+    // wins/total across all pairs the player appears in
+    const byId: Record<number, Score> = {}
     for (const p of players) {
-      const t = (p.team || "").toUpperCase();
-      if (t) set.add(t);
+      byId[p.player_id] = { player_id: p.player_id, wins: 0, total: 0, score: 50 }
     }
-    return ["ALL", ...Array.from(set).sort()];
-  }, [players]);
-
-  // ---- Vote handler ----
-  const doVote = async (winner: Player, loser: Player) => {
-    try {
-      setVoting(true);
-      const left_id = pair[0]?.player_id ?? null;
-      const right_id = pair[1]?.player_id ?? null;
-      const { error } = await supabase.from("pair_votes").insert({
-        left_player_id: left_id,
-        right_player_id: right_id,
-        winner_player_id: winner.player_id,
-      });
-      if (error) {
-        console.error("insert vote error", error);
-      }
-    } finally {
-      setVoting(false);
-      dealPair(); // show a fresh pair
-      // Optimistic: nudge the winner’s score locally to feel responsive (optional)
-      setRanking(prev => {
-        const n = prev.map(r =>
-          r.player.player_id === (winner.player_id)
-            ? { ...r, total: r.total + 1, wins: r.wins + 1, score: ((r.wins + 1) / (r.total + 1)) * 100 }
-            : r.player.player_id === (loser.player_id)
-            ? { ...r, total: r.total + 1, score: (r.wins / (r.total + 1)) * 100 }
-            : r
-        );
-        n.sort((a, b) => b.score - a.score);
-        return n;
-      });
+    for (const row of pairs) {
+      const a = byId[row.p_small]; const b = byId[row.p_large]
+      if (!a || !b) continue
+      a.wins += row.wins_small
+      b.wins += row.wins_large
+      a.total += row.n_votes
+      b.total += row.n_votes
     }
-  };
+    // Laplace smoothing so new players don’t start at 0/NaN
+    for (const s of Object.values(byId)) {
+      const wins = s.wins + 1
+      const total = s.total + 2
+      s.score = 100 * (total > 0 ? wins / total : 0.5)
+      s.wins = wins
+      s.total = total
+    }
+    return byId
+  }, [players, pairs])
 
-  // ---- Render helpers ----
-  const PlayerCard = ({ p, onVote }: { p: Player; onVote: () => void }) => {
-    const head = p.headshot_url;
-    return (
-      <div style={{
-        border: "1px solid #ddd",
-        borderRadius: 12,
-        padding: 12,
-        width: 340,
-        display: "flex",
-        gap: 12,
-        alignItems: "center",
-        boxShadow: "0 1px 3px rgba(0,0,0,0.08)"
-      }}>
-        <div style={{
-          width: 64, height: 64, borderRadius: 8, overflow: "hidden",
-          display: "flex", alignItems: "center", justifyContent: "center",
-          background: "#f3f4f6", border: "1px solid #e5e7eb", flexShrink: 0
-        }}>
-          {head ? (
-            // Avoid layout shift while loading images
-            <img src={head} alt={p.player_name} width={64} height={64} style={{ objectFit: "cover" }} />
-          ) : (
-            <div style={{ fontWeight: 700, fontSize: 20 }}>{initials(p.player_name)}</div>
-          )}
-        </div>
-        <div style={{ flex: 1 }}>
-          <div style={{ fontWeight: 700 }}>{p.player_name}</div>
-          <div style={{ fontSize: 12, color: "#4b5563" }}>
-            {(p.team || "").toUpperCase()}
-            {p.salary_text ? ` • ${p.salary_text}` : p.salary_2026 ? ` • ${fmtMoney(p.salary_2026)}` : ""}
-          </div>
-          <button
-            onClick={onVote}
-            disabled={voting}
-            style={{
-              marginTop: 8,
-              padding: "6px 10px",
-              borderRadius: 8,
-              border: "1px solid #e5e7eb",
-              background: voting ? "#f9fafb" : "#111827",
-              color: voting ? "#6b7280" : "white",
-              cursor: voting ? "not-allowed" : "pointer"
-            }}
-          >
-            VOTE
-          </button>
-        </div>
-      </div>
-    );
-  };
+  // ---- filtered list and rankings
+  const filteredPlayers = useMemo(() => {
+    if (teamFilter === 'All Teams') return players
+    return players.filter(p => (p.team || '') === teamFilter)
+  }, [players, teamFilter])
 
-  // ---- UI ----
+  const rankings = useMemo(() => {
+    return [...players]
+      .map(p => ({ p, s: coverage[p.player_id]?.score ?? 50 }))
+      .sort((a, b) => b.s - a.s)
+  }, [players, coverage])
+
+  // ---- pick a pair (ε-greedy to boost coverage)
+  function newPair() {
+    const epsilon = 0.35 // exploration rate
+    const pool = filteredPlayers
+    if (pool.length < 2) { setLeft(null); setRight(null); return }
+
+    let a: Player
+    let b: Player
+
+    if (Math.random() < epsilon) {
+      // explore: prioritize under-voted
+      const sortedByVotes = [...pool].sort((x, y) =>
+        (coverage[x.player_id]?.total ?? 0) - (coverage[y.player_id]?.total ?? 0)
+      )
+      a = sortedByVotes[0]
+      b = sortedByVotes.find(p => p.player_id !== a.player_id) || sortedByVotes[1]
+    } else {
+      // exploit: random two
+      const i = Math.floor(Math.random() * pool.length)
+      let j = Math.floor(Math.random() * (pool.length - 1))
+      if (j >= i) j += 1
+      a = pool[i]
+      b = pool[j]
+    }
+
+    // avoid same-player and keep consistent ordering
+    if (a.player_id === b.player_id) { return newPair() }
+    setLeft(a); setRight(b)
+  }
+
+  useEffect(() => { if (!loading) newPair() }, [loading, teamFilter])
+
+  // ---- voting
+  async function vote(winner: 'left' | 'right') {
+    if (!left || !right) return
+    setSubmitting(true)
+    const winner_id = (winner === 'left') ? left.player_id : right.player_id
+    const { error } = await supabase.from('pair_votes').insert([{
+      left_player_id: left.player_id,
+      right_player_id: right.player_id,
+      winner_player_id: winner_id,
+    }])
+    setSubmitting(false)
+    if (error) { console.error('vote error', error); return }
+
+    // refresh aggregates only (cheap)
+    const { data: aData, error: aErr } = await supabase
+      .from('tv_pairwise_aggregates')
+      .select('p_small,p_large,wins_small,wins_large,n_votes')
+    if (!aErr && aData) setPairs(aData)
+
+    newPair()
+  }
+
   return (
-    <div style={{ maxWidth: 980, margin: "0 auto", padding: 16 }}>
-      <h1 style={{ fontSize: 28, fontWeight: 800, marginBottom: 8 }}>
-        HoopsHype Trade-Value Voter
-      </h1>
-      <div style={{ color: "#374151", marginBottom: 12 }}>
-        Pick who has more <b>trade value</b>. Rankings update live.
-      </div>
+    <div className="container">
+      <h1>HoopsHype <span className="accent">Trade</span>-Value Voter</h1>
+      <p className="sub">
+        Pick who has more <strong>trade value</strong>. Rankings update live.
+      </p>
 
-      <div style={{ display: "flex", gap: 8, alignItems: "center", marginBottom: 14 }}>
-        <span>Team view:</span>
-        <select
-          value={teamFilter}
-          onChange={(e) => setTeamFilter(e.target.value)}
-          style={{ padding: "6px 8px", borderRadius: 8, border: "1px solid #e5e7eb" }}
-        >
-          {teams.map(t => <option key={t} value={t}>{t === "ALL" ? "All Teams" : t}</option>)}
+      <div className="toolbar">
+        <label>Team view:&nbsp;</label>
+        <select value={teamFilter} onChange={(e) => setTeamFilter(e.target.value)}>
+          {TEAMS.map(t => <option key={t} value={t}>{t}</option>)}
         </select>
-        <button
-          onClick={dealPair}
-          style={{ marginLeft: 6, padding: "6px 10px", borderRadius: 8, border: "1px solid #e5e7eb", background: "#f9fafb" }}
-        >
-          New Pair
-        </button>
+        <button onClick={newPair} className="btn">New Pair</button>
       </div>
 
-      {/* Pair */}
-      <div style={{ display: "flex", gap: 16, marginBottom: 20 }}>
-        {loadingPlayers ? (
-          <div>Loading players…</div>
-        ) : pair[0] && pair[1] ? (
-          <>
-            <PlayerCard p={pair[0]} onVote={() => doVote(pair[0]!, pair[1]!)} />
-            <PlayerCard p={pair[1]} onVote={() => doVote(pair[1]!, pair[0]!)} />
-          </>
-        ) : (
-          <div>No players available for this filter.</div>
-        )}
-      </div>
-
-      {/* Rankings */}
-      <h2 style={{ fontSize: 22, fontWeight: 800, marginTop: 20, marginBottom: 10 }}>Overall Rankings</h2>
-      {loadingRanks ? (
-        <div>Loading rankings…</div>
+      {loading ? (
+        <div className="loading">Loading players…</div>
+      ) : filteredPlayers.length < 2 ? (
+        <div className="loading">No players available for this filter.</div>
       ) : (
-        <ol style={{ paddingLeft: 20, lineHeight: 1.7 }}>
-          {ranking.map((r, i) => (
-            <li key={r.player.player_id}>
-              {i + 1}. {r.player.player_name} ({(r.player.team || "").toUpperCase()})
-              {r.player.salary_text ? ` • ${r.player.salary_text}` : ""}
-              {` • score ${r.score.toFixed(4)}`}
-            </li>
+        <div className="duel">
+          {[left, right].map((pl, i) => (
+            <div key={i} className="card">
+              {pl ? (
+                <>
+                  <img
+                    src={pl.headshot_url || letterAvatar(pl.player_name)}
+                    alt={pl.player_name}
+                    className="headshot"
+                    onError={(e) => { (e.currentTarget as HTMLImageElement).src = letterAvatar(pl.player_name) }}
+                  />
+                  <div className="name">{pl.player_name}</div>
+                  <div className="meta">{(pl.team || '').toUpperCase()} • {pl.salary_text || ''}</div>
+                  <button
+                    disabled={submitting}
+                    onClick={() => vote(i === 0 ? 'left' : 'right')}
+                    className="btn primary"
+                  >
+                    VOTE
+                  </button>
+                </>
+              ) : <div className="loading">Loading…</div>}
+            </div>
           ))}
-        </ol>
+        </div>
       )}
+
+      <h2>Overall Rankings</h2>
+      <ol className="rankings">
+        {rankings.map(({ p, s }) => (
+          <li key={p.player_id}>
+            <span className="rank-name">{p.player_name}</span>
+            <span className="rank-team">{(p.team || '').toUpperCase()}</span>
+            <span className="rank-salary">{p.salary_text || ''}</span>
+            <span className="rank-score">score {formatScore(s / 100)}</span>
+          </li>
+        ))}
+      </ol>
     </div>
-  );
+  )
 }
